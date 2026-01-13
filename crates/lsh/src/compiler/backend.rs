@@ -4,6 +4,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::transmute;
 
+use stdext::arena::scratch_arena;
+
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -80,10 +82,21 @@ impl<'a> Backend<'a> {
                     match ir.instr {
                         IRI::Noop => {}
                         IRI::Add { dst, src, imm } => {
-                            // NOTE: read/write call order is crucial.
+                            // NOTE: read/write call order is crucial. See `read_reg`.
                             let src = self.read_reg(src)?;
                             let dst = self.write_reg(dst)?;
-                            self.push_instruction(Add { dst, src, imm });
+                            match (src, imm) {
+                                (Register::Zero, _) => {
+                                    self.push_instruction(MovImm { dst, imm });
+                                }
+                                (_, 0) => {
+                                    self.push_instruction(Mov { dst, src });
+                                }
+                                _ => {
+                                    self.push_instruction(Mov { dst, src });
+                                    self.push_instruction(AddImm { dst, imm });
+                                }
+                            };
                         }
                         IRI::If { condition, then } => {
                             self.stack.push_back(then);
@@ -92,46 +105,55 @@ impl<'a> Backend<'a> {
                                 Condition::Cmp { lhs, rhs, op } => {
                                     let lhs = self.read_reg(lhs)?;
                                     let rhs = self.read_reg(rhs)?;
-                                    self.push_instruction(If { lhs, rhs, op });
-                                    let dst = self.dst_by_node(then);
-                                    self.push_instruction(Add {
-                                        dst: Register::ProgramCounter,
-                                        src: Register::Zero,
-                                        imm: dst as i32,
-                                    });
+                                    let off = self.dst_by_node(then) as u32;
+
+                                    match op {
+                                        ComparisonOp::Eq => {
+                                            self.push_instruction(JumpEQ { lhs, rhs, tgt: off });
+                                        }
+                                        ComparisonOp::Ne => {
+                                            self.push_instruction(JumpNE { lhs, rhs, tgt: off });
+                                        }
+                                        ComparisonOp::Lt => {
+                                            self.push_instruction(JumpLT { lhs, rhs, tgt: off });
+                                        }
+                                        ComparisonOp::Gt => {
+                                            self.push_instruction(JumpGT { lhs, rhs, tgt: off });
+                                        }
+                                        ComparisonOp::Le => {
+                                            self.push_instruction(JumpLE { lhs, rhs, tgt: off });
+                                        }
+                                        ComparisonOp::Ge => {
+                                            self.push_instruction(JumpGE { lhs, rhs, tgt: off });
+                                        }
+                                    }
                                 }
                                 Condition::EndOfLine => {
-                                    let dst = self.dst_by_node(then);
-                                    self.push_instruction(JumpIfEndOfLine { dst });
+                                    let off = self.dst_by_node(then) as u32;
+                                    self.push_instruction(JumpIfEndOfLine { tgt: off });
                                 }
                                 Condition::Charset(h) => {
-                                    let idx = self.visit_charset(h);
-                                    let dst = self.dst_by_node(then);
-                                    self.push_instruction(JumpIfMatchCharset { idx, dst });
+                                    let idx = self.visit_charset(h) as u32;
+                                    let off = self.dst_by_node(then) as u32;
+                                    self.push_instruction(JumpIfMatchCharset { idx, tgt: off });
                                 }
                                 Condition::Prefix(s) => {
-                                    let idx = self.visit_string(s);
-                                    let dst = self.dst_by_node(then);
-                                    self.push_instruction(JumpIfMatchPrefix { idx, dst });
+                                    let idx = self.visit_string(s) as u32;
+                                    let off = self.dst_by_node(then) as u32;
+                                    self.push_instruction(JumpIfMatchPrefix { idx, tgt: off });
                                 }
                                 Condition::PrefixInsensitive(s) => {
-                                    let idx = self.visit_string(s);
-                                    let dst = self.dst_by_node(then);
+                                    let idx = self.visit_string(s) as u32;
+                                    let off = self.dst_by_node(then) as u32;
                                     self.push_instruction(
-                                        Instruction::JumpIfMatchPrefixInsensitive { idx, dst },
+                                        Instruction::JumpIfMatchPrefixInsensitive { idx, tgt: off },
                                     );
                                 }
                             }
                         }
-                        IRI::Push { mask } => {
-                            self.push_instruction(Push { mask });
-                        }
-                        IRI::Pop { mask } => {
-                            self.push_instruction(Pop { mask });
-                        }
                         IRI::Call { name } => {
-                            let dst = self.dst_by_name(name);
-                            self.push_instruction(Call { dst });
+                            let off = self.dst_by_name(name) as u32;
+                            self.push_instruction(Call { tgt: off });
                         }
                         IRI::Return => {
                             self.push_instruction(Return);
@@ -159,10 +181,9 @@ impl<'a> Backend<'a> {
 
                     // If the tail end of this IR chain is already compiled, we jump there.
                     if ir.offset != usize::MAX {
-                        self.push_instruction(Add {
+                        self.push_instruction(MovImm {
                             dst: Register::ProgramCounter,
-                            src: Register::Zero,
-                            imm: ir.offset as i32,
+                            imm: ir.offset as u32,
                         });
                         break;
                     }
@@ -170,8 +191,6 @@ impl<'a> Backend<'a> {
             }
 
             self.process_relocations();
-
-            self.assembly.instructions[entrypoint_offset].label = function.name;
         }
 
         if !self.relocations.is_empty() {
@@ -213,7 +232,27 @@ impl<'a> Backend<'a> {
     }
 
     fn push_instruction(&mut self, instr: Instruction) {
-        self.assembly.instructions.push(AnnotatedInstruction { instr, label: "" });
+        // If we have a pending relocation for the instruction we're about to write,
+        // we can now calculate the exact byte offset of the immediate value that
+        // needs to be patched and update the relocation accordingly.
+        //
+        // This allows `process_relocations` to simply overwrite the bytes at the
+        // stored offset without having to decode specific instructions.
+        if let Some(reloc) = self.relocations.last_mut() {
+            let offset = match reloc {
+                Relocation::ByName(off, _) => off,
+                Relocation::ByNode(off, _) => off,
+            };
+
+            if *offset == self.assembly.instructions.len()
+                && let Some(delta) = instr.address_offset()
+            {
+                *offset += delta;
+            }
+        }
+
+        let scratch = scratch_arena(None);
+        self.assembly.instructions.extend(instr.encode(&scratch));
     }
 
     /// Prepares a virtual register from IR for write-use in an instruction.
@@ -317,18 +356,11 @@ impl<'a> Backend<'a> {
                 },
             };
 
-            match &mut self.assembly.instructions[off].instr {
-                Instruction::Add { dst: Register::ProgramCounter, src: Register::Zero, imm } => {
-                    *imm = resolved as i32;
-                }
-                Instruction::Call { dst }
-                | Instruction::JumpIfEndOfLine { dst }
-                | Instruction::JumpIfMatchCharset { dst, .. }
-                | Instruction::JumpIfMatchPrefix { dst, .. }
-                | Instruction::JumpIfMatchPrefixInsensitive { dst, .. } => {
-                    *dst = resolved;
-                }
-                i => panic!("Unexpected relocation target: {i:?}"),
+            let range = off..off + 4;
+            if let Some(target) = self.assembly.instructions.get_mut(range) {
+                target.copy_from_slice(&(resolved as u32).to_le_bytes());
+            } else {
+                panic!("Unexpected relocation target offset: {off}");
             }
 
             false
