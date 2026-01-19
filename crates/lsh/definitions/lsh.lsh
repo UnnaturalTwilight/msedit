@@ -1,5 +1,9 @@
+#[display_name = "LSH"]
+#[path = "**/*.lsh"]
 pub fn lsh() {
     until /$/ {
+        yield other;
+
         if /\/\/.*/ {
             yield comment;
         } else if /pub|fn|await/ {
@@ -8,7 +12,7 @@ pub fn lsh() {
             } else {
                 yield keyword.other;
             }
-        } else if /if|else|until|loop/ {
+        } else if /if|else|until|loop|break|continue/ {
             if /\w+/ {
                 yield other;
             } else {
@@ -25,7 +29,7 @@ pub fn lsh() {
                 }
                 if /[\w.]+/ {
                     // The yield argument
-                    yield string;
+                    yield markup.link;
                 }
             }
         } else if /\// {
@@ -33,11 +37,12 @@ pub fn lsh() {
                 if /\\./ {
                     // Skip escape char
                 } else if /\// {
+                    yield string;
                     break;
                 }
             }
+        } else if /"/ {
+            double_quote_string();
         }
-
-        yield other;
     }
 }

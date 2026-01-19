@@ -1,43 +1,73 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#![feature(allocator_api)]
+
 use std::hint::black_box;
 use std::io::Cursor;
 use std::ops::Range;
 use std::path::Path;
 use std::{mem, vec};
 
+use ::lsh::engine::process_file_associations;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use edit::helpers::*;
+use edit::lsh::{FILE_ASSOCIATIONS, Highlighter, LANGUAGES};
 use edit::simd::MemsetSafe;
-use edit::{buffer, hash, lsh, oklab, simd, unicode};
-use serde::Deserialize;
-use stdext::arena::scratch_arena;
+use edit::{buffer, hash, json, oklab, simd, unicode};
+use stdext::arena::{Arena, scratch_arena};
 use stdext::{arena, varint};
 
-#[derive(Deserialize)]
-pub struct EditingTracePatch(pub usize, pub usize, pub String);
+struct EditingTracePatch<'a>(usize, usize, &'a str);
 
-#[derive(Deserialize)]
-pub struct EditingTraceTransaction {
-    pub patches: Vec<EditingTracePatch>,
+struct EditingTraceTransaction<'a> {
+    patches: Vec<EditingTracePatch<'a>, &'a Arena>,
 }
 
-#[derive(Deserialize)]
-pub struct EditingTraceData {
-    #[serde(rename = "startContent")]
-    pub start_content: String,
-    #[serde(rename = "endContent")]
-    pub end_content: String,
-    pub txns: Vec<EditingTraceTransaction>,
+struct EditingTraceData<'a> {
+    start_content: &'a str,
+    end_content: &'a str,
+    txns: Vec<EditingTraceTransaction<'a>, &'a Arena>,
 }
 
 fn bench_buffer(c: &mut Criterion) {
-    let data = include_bytes!("../../../assets/editing-traces/rustcode.json.zst");
-    let data = zstd::decode_all(Cursor::new(data)).unwrap();
-    let data: EditingTraceData = serde_json::from_slice(&data).unwrap();
-    let mut patches_with_coords = Vec::new();
+    let scratch = scratch_arena(None);
+    let data = {
+        let data = include_bytes!("../../../assets/editing-traces/rustcode.json.zst");
+        let data = zstd::decode_all(Cursor::new(data)).unwrap();
+        let data = str::from_utf8(&data).unwrap();
 
+        let data = json::parse(&scratch, data).unwrap();
+        let root = data.as_object().unwrap();
+        let txns = root.get_array("txns").unwrap();
+
+        let mut res = EditingTraceData {
+            start_content: root.get_str("startContent").unwrap(),
+            end_content: root.get_str("endContent").unwrap(),
+            txns: Vec::with_capacity_in(txns.len(), &scratch),
+        };
+
+        for txn in txns {
+            let txn = txn.as_object().unwrap();
+            let patches = txn.get_array("patches").unwrap();
+            let mut txn =
+                EditingTraceTransaction { patches: Vec::with_capacity_in(patches.len(), &scratch) };
+
+            for patch in patches {
+                let patch = patch.as_array().unwrap();
+                let offset = patch[0].as_number().unwrap() as usize;
+                let del_len = patch[1].as_number().unwrap() as usize;
+                let ins_str = patch[2].as_str().unwrap();
+                txn.patches.push(EditingTracePatch(offset, del_len, ins_str));
+            }
+
+            res.txns.push(txn);
+        }
+
+        res
+    };
+
+    let mut patches_with_coords = Vec::new();
     {
         let mut tb = buffer::TextBuffer::new(false).unwrap();
         tb.set_crlf(false);
@@ -51,7 +81,7 @@ fn bench_buffer(c: &mut Criterion) {
                 tb.delete(buffer::CursorMovement::Grapheme, p.1 as CoordType);
 
                 tb.write_raw(p.2.as_bytes());
-                patches_with_coords.push((beg, p.1 as CoordType, p.2.clone()));
+                patches_with_coords.push((beg, p.1 as CoordType, p.2));
             }
         }
 
@@ -129,11 +159,26 @@ fn bench_hash(c: &mut Criterion) {
         });
 }
 
+fn bench_json(c: &mut Criterion) {
+    let str = include_str!("../../../assets/highlighting-tests/json.json");
+
+    c.benchmark_group("json").throughput(Throughput::Bytes(str.len() as u64)).bench_function(
+        "parse",
+        |b| {
+            b.iter(|| {
+                let scratch = scratch_arena(None);
+                let obj = json::parse(&scratch, black_box(str)).unwrap();
+                black_box(obj);
+            })
+        },
+    );
+}
+
 fn bench_lsh(c: &mut Criterion) {
     let bytes = include_bytes!("../../../assets/highlighting-tests/markdown.md");
     let bytes = &bytes[..];
-    let lang = lsh::language_from_path(Path::new("markdown.md")).unwrap();
-    let highlighter = lsh::Highlighter::new(black_box(&bytes), lang);
+    let lang = LANGUAGES.iter().find(|lang| lang.id == "markdown").unwrap();
+    let highlighter = Highlighter::new(black_box(&bytes), lang);
 
     c.benchmark_group("lsh").throughput(Throughput::Bytes(bytes.len() as u64)).bench_function(
         "markdown",
@@ -150,6 +195,11 @@ fn bench_lsh(c: &mut Criterion) {
             })
         },
     );
+
+    c.benchmark_group("lsh").bench_function("process_file_associations", |b| {
+        let path = Path::new("/some/long/path/to/file/foo.bar.foo.bar.foo.bar");
+        b.iter(|| process_file_associations(FILE_ASSOCIATIONS, black_box(path)))
+    });
 }
 
 fn bench_oklab(c: &mut Criterion) {
@@ -325,6 +375,7 @@ fn bench(c: &mut Criterion) {
 
     bench_buffer(c);
     bench_hash(c);
+    bench_json(c);
     bench_lsh(c);
     bench_oklab(c);
     bench_simd_lines_fwd(c);

@@ -1,13 +1,15 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt::format;
 use std::fs::read_dir;
 use std::io;
 use std::path::PathBuf;
 
-use super::compiler::*;
+use stdext::arena::scratch_arena;
+
 use super::*;
 
 pub struct Generator<'a> {
@@ -88,10 +90,9 @@ impl<'a> Generator<'a> {
         let comment_prefix = if vt { "\x1b[32m" } else { "" }; // green
         let comment_suffix = if vt { "\x1b[39m" } else { "" };
 
-        let mut labels = std::collections::HashMap::new();
-        for (name, offset) in &assembly.entrypoints {
-            labels.insert(*offset, *name);
-        }
+        // TODO: This is kind of stupid. There should be per-instruction annotations.
+        let labels: HashMap<usize, &str> =
+            assembly.entrypoints.iter().map(|ep| (ep.address, ep.name.as_str())).collect();
 
         let mut off = 0;
         while off < assembly.instructions.len() {
@@ -154,6 +155,7 @@ impl<'a> Generator<'a> {
 
         let mut output = String::new();
         output.push_str("// This file is auto-generated. Do not edit it manually.\n\n");
+        output.push_str("use lsh::engine::Language;\n\n");
 
         output.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum HighlightKind {\n");
         let members: Vec<_> = assembly
@@ -171,13 +173,16 @@ impl<'a> Generator<'a> {
             _ = write!(
                 output,
                 "
-impl HighlightKind {{
-    /// # Safety
-    /// Don't pass the wrong thing you dummy.
+impl TryFrom<u32> for HighlightKind {{
+    type Error = ();
+
     #[inline]
-    pub const unsafe fn from_usize(value: usize) -> Self {{
-        debug_assert!(value <= Self::{} as usize);
-        unsafe {{ std::mem::transmute::<u8, Self>(value as u8) }}
+    fn try_from(value: u32) -> Result<Self, Self::Error> {{
+        if value <= Self::{} as u32 {{
+            Ok(unsafe {{ std::mem::transmute::<u8, Self>(value as u8) }})
+        }} else {{
+            Err(())
+        }}
     }}
 }}
 ",
@@ -185,58 +190,29 @@ impl HighlightKind {{
             );
         }
 
-        output.push_str(
-            "
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-pub struct Registers {
-    pub zero: u32, // x0 = Zero
-    pub pc: u32,   // x1 = ProgramCounter
-    pub off: u32,  // x2 = InputOffset
-    pub hs: u32,   // z3 = HighlightStart
-    pub hk: u32,   // x4 = HighlightKind
-    pub x5: u32,
-    pub x6: u32,
-    pub x7: u32,
-    pub x8: u32,
-    pub x9: u32,
-    pub x10: u32,
-    pub x11: u32,
-    pub x12: u32,
-    pub x13: u32,
-    pub x14: u32,
-    pub x15: u32,
-}
-
-impl Registers {
-    #[inline(always)]
-    pub fn get(&self, reg: usize) -> u32 {
-        debug_assert!(reg < 16);
-        unsafe { (self as *const _ as *const u32).add(reg).read() }
-    }
-
-    #[inline(always)]
-    pub fn set(&mut self, reg: usize, val: u32) {
-        debug_assert!(reg < 16);
-        unsafe { (self as *mut _ as *mut u32).add(reg).write(val) }
-    }
-}
-
-",
-        );
-
-        output.push_str("/**\n");
+        output.push_str("/*\n");
         output.push_str(&self.compiler.as_mermaid());
-        output.push_str("**/\n");
+        output.push_str("*/\n");
 
-        for (name, offset) in &assembly.entrypoints {
+        output.push_str("\n#[rustfmt::skip] pub const LANGUAGES: &[Language] = &[\n");
+        for ep in &assembly.entrypoints {
             _ = writeln!(
                 output,
-                "pub const ENTRYPOINT_{}: u32 = {};",
-                name.to_ascii_uppercase(),
-                offset
+                "    Language {{ id: {:?}, name: {:?}, entrypoint: {} }},",
+                ep.name, ep.display_name, ep.address
             );
         }
+        output.push_str("];\n");
+
+        output.push_str(
+            "\n#[rustfmt::skip] pub const FILE_ASSOCIATIONS: &[(&str, &Language)] = &[\n",
+        );
+        for (idx, ep) in assembly.entrypoints.iter().enumerate() {
+            for path in &ep.paths {
+                _ = writeln!(output, "    ({path:?}, &LANGUAGES[{idx}]),");
+            }
+        }
+        output.push_str("];\n");
 
         _ = writeln!(
             output,
@@ -245,10 +221,9 @@ impl Registers {
         );
         let line_num_width = assembly.instructions.len().checked_ilog10().unwrap_or(0) as usize + 1;
 
-        let mut labels = std::collections::HashMap::new();
-        for (name, offset) in &assembly.entrypoints {
-            labels.insert(*offset, *name);
-        }
+        // TODO: This is kind of stupid. There should be per-instruction annotations.
+        let labels: HashMap<usize, &str> =
+            assembly.entrypoints.iter().map(|ep| (ep.address, ep.name.as_str())).collect();
 
         let mut off = 0;
         while off < assembly.instructions.len() {

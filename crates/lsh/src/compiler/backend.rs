@@ -46,8 +46,9 @@ impl<'a> Backend<'a> {
     pub fn compile(mut self, compiler: &Compiler<'a>) -> CompileResult<Assembly<'a>> {
         use Instruction::*;
 
+        compiler.count_register_uses();
+
         for function in &mut compiler.functions.clone() {
-            // NOTE: This depends on the register `read_count` computed in `count_register_uses`.
             self.registers = Default::default();
 
             let entrypoint_offset = self.assembly.instructions.len();
@@ -211,7 +212,12 @@ impl<'a> Backend<'a> {
             .functions
             .iter()
             .filter(|f| f.public)
-            .map(|f| (f.name, f.body.borrow().offset))
+            .map(|f| Entrypoint {
+                name: f.name.to_string(),
+                display_name: f.attributes.display_name.unwrap_or(f.name).to_string(),
+                paths: f.attributes.paths.iter().map(|s| s.to_string()).collect(),
+                address: f.body.borrow().offset,
+            })
             .collect();
         self.assembly.highlight_kinds = compiler.highlight_kinds.clone();
         Ok(self.assembly)

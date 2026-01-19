@@ -1,0 +1,25 @@
+#[display_name = "Properties"]
+#[path = "**/.config/git/config"]
+#[path = "**/.git/config"]
+#[path = "**/*.cfg"]
+#[path = "**/*.conf"]
+#[path = "**/*.directory"]
+#[path = "**/*.editorconfig"]
+#[path = "**/*.gitattributes"]
+#[path = "**/*.gitconfig"]
+#[path = "**/*.gitmodules"]
+#[path = "**/*.properties"]
+#[path = "**/*.repo"]
+pub fn properties() {
+    until /$/ {
+        yield other;
+
+        if /#.*/ {
+            yield comment;
+        } else if /'/ {
+            single_quote_string();
+        } else if /"/ {
+            double_quote_string();
+        }
+    }
+}

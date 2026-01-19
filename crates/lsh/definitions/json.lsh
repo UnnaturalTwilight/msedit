@@ -1,3 +1,6 @@
+#[display_name = "JSON"]
+#[path = "**/*.json"]
+#[path = "**/*.jsonc"]
 pub fn json() {
     until /$/ {
         yield other;
@@ -14,14 +17,7 @@ pub fn json() {
                 }
             }
         } else if /"/ {
-            until /$/ {
-                if /\\./ {
-                    // Escape sequences
-                } else if /"/ {
-                    yield string;
-                    break;
-                }
-            }
+            double_quote_string();
         } else if /true|false|null/ {
             if /\w+/ {
                 // Not a keyword after all.
@@ -34,7 +30,7 @@ pub fn json() {
             } else {
                 yield constant.numeric;
             }
-        } else if /\S+/ {
+        } else if /\w+/ {
             // Invalid token? Skip.
         }
     }
