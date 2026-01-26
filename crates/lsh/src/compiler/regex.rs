@@ -1,6 +1,58 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! Regex-to-IR compiler using `regex_syntax` as the parser.
+//!
+//! ## Supported patterns
+//!
+//! - Literals: `foo`, `bar`
+//! - Character classes: `[a-z]`, `[^0-9]`, `.` (any byte), `\w`, `\d`, etc.
+//! - Quantifiers: `?`, `+`, `*` (greedy only)
+//! - Alternation: `a|b|c`
+//! - Concatenation: `abc`
+//! - Capture groups: `(...)` (for `yield $1 as color`)
+//! - Word boundary: `\b` (ASCII only, via `Look::WordEndHalfAscii`)
+//! - End of line: `$`
+//!
+//! ## NOT supported (will panic)
+//!
+//! - Non-greedy quantifiers: `*?`, `+?`, `??`
+//! - Bounded repetition: `{n,m}`
+//! - Lookahead/lookbehind: `(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`
+//! - Backreferences: `\1`
+//! - Unicode categories: `\p{L}`
+//!
+//! ## Charset expansion
+//!
+//! Single-character classes like `[eE]` get expanded into a chain of `Prefix` conditions
+//! rather than using `Charset`. This is because prefix matching advances `off` by exactly
+//! the matched length, while charset matching is greedy (matches as many as possible).
+//!
+//! ## Case-insensitive optimization
+//!
+//! Sequences like `[aA][bB][cC]` get merged into `PrefixInsensitive("abc")`. The merger
+//! looks for consecutive 2-range classes where both ranges are single-char case variants.
+//!
+//! ## Alternation fallback optimization
+//!
+//! For patterns like `[a-z]+|\w+`, the compiler tries to chain alternatives so that if
+//! the more specific pattern fails partway through, it falls back to the more general one.
+//! This is the `try_append_as_fallback` logic - it's complex and may have edge cases.
+//!
+//! ## UTF-8 hack
+//!
+//! If a charset includes `\w` (word characters), the compiler also sets bits for UTF-8
+//! continuation byte starters (0xC2-0xF4). This lets `\w+` consume multibyte characters
+//! even though we operate on bytes. It's not Unicode-correct but works for identifiers.
+//!
+//! ## Gotchas
+//!
+//! - The `parse()` function modifies `dst_good`/`dst_bad` nodes' `.next` pointers. Don't
+//!   pass nodes that are already wired into the IR graph.
+//! - `.` matches any byte including newline (configured via `dot_matches_new_line(true)`).
+//! - Returning `Err(String)` but the caller wraps it in `CompileError`. Should just return
+//!   `CompileError` directly.
+
 use std::ops::RangeInclusive;
 use std::ptr;
 
@@ -13,6 +65,7 @@ pub fn parse<'a>(
     pattern: &str,
     dst_good: IRCell<'a>,
     dst_bad: IRCell<'a>,
+    capture_groups: &mut Vec<(IRRegCell<'a>, IRRegCell<'a>), &'a Arena>,
 ) -> Result<IRCell<'a>, String> {
     let hir = match regex_syntax::ParserBuilder::new()
         .utf8(false)
@@ -25,7 +78,7 @@ pub fn parse<'a>(
         Err(e) => return Err(format!("{e}")),
     };
 
-    let src = transform(compiler, dst_good, &hir)?;
+    let src = transform(compiler, dst_good, &hir, capture_groups)?;
 
     // Connect all unset .next pointers to dst_bad.
     for node in compiler.visit_nodes_from(src) {
@@ -45,6 +98,7 @@ fn transform<'a>(
     compiler: &mut Compiler<'a>,
     dst: IRCell<'a>,
     hir: &Hir,
+    capture_groups: &mut Vec<(IRRegCell<'a>, IRRegCell<'a>), &'a Arena>,
 ) -> Result<IRCell<'a>, String> {
     fn is_any_class(class: &ClassBytes) -> bool {
         class.ranges() == [ClassBytesRange::new(0, 255)]
@@ -83,7 +137,7 @@ fn transform<'a>(
                 }
             }
             (0, Some(1), true, _) => {
-                let src = transform(compiler, dst, &rep.sub)?;
+                let src = transform(compiler, dst, &rep.sub, capture_groups)?;
                 transform_option(src, dst)
             }
             (1, None, true, HirKind::Literal(lit)) => transform_literal_plus(compiler, dst, lit),
@@ -92,8 +146,46 @@ fn transform<'a>(
             }
             _ => panic!("Unsupported HIR: {hir:?}"),
         },
-        HirKind::Concat(hirs) => transform_concat(compiler, dst, hirs),
-        HirKind::Alternation(hirs) => transform_alt(compiler, dst, hirs),
+        HirKind::Concat(hirs) => transform_concat(compiler, dst, hirs, capture_groups),
+        HirKind::Alternation(hirs) => transform_alt(compiler, dst, hirs, capture_groups),
+        HirKind::Capture(capture) => {
+            // Save the current input offset before matching the capture group
+            let start_vreg = compiler.alloc_vreg();
+            let save_start = compiler.alloc_iri(IRI::Mov {
+                dst: start_vreg,
+                src: compiler.get_reg(Register::InputOffset),
+            });
+
+            // Transform the sub-expression
+            let end_marker = compiler.alloc_noop();
+            save_start.borrow_mut().set_next(transform(
+                compiler,
+                end_marker,
+                &capture.sub,
+                capture_groups,
+            )?);
+
+            // Save the end offset after matching
+            let end_vreg = compiler.alloc_vreg();
+            let save_end = compiler.alloc_iri(IRI::Mov {
+                dst: end_vreg,
+                src: compiler.get_reg(Register::InputOffset),
+            });
+            end_marker.borrow_mut().set_next(save_end);
+            save_end.borrow_mut().set_next(dst);
+
+            // Store the capture group (index is 1-based in regex, 0-based in our vec)
+            let vec_index = (capture.index as usize).saturating_sub(1);
+            // Ensure the vector is large enough
+            while capture_groups.len() <= vec_index {
+                let dummy_start = compiler.alloc_vreg();
+                let dummy_end = compiler.alloc_vreg();
+                capture_groups.push((dummy_start, dummy_end));
+            }
+            capture_groups[vec_index] = (start_vreg, end_vreg);
+
+            Ok(save_start)
+        }
         _ => panic!("Unsupported HIR: {hir:?}"),
     }
 }
@@ -202,11 +294,7 @@ fn transform_any_star<'a>(
 ) -> Result<IRCell<'a>, String> {
     Ok(compiler.alloc_ir(IR {
         next: Some(dst),
-        instr: IRI::Add {
-            dst: compiler.get_reg(Register::InputOffset),
-            src: compiler.get_reg(Register::Zero),
-            imm: u32::MAX,
-        },
+        instr: IRI::MovImm { dst: compiler.get_reg(Register::InputOffset), imm: u32::MAX },
         offset: usize::MAX,
     }))
 }
@@ -215,11 +303,7 @@ fn transform_any_star<'a>(
 fn transform_any<'a>(compiler: &mut Compiler<'a>, dst: IRCell<'a>) -> Result<IRCell<'a>, String> {
     Ok(compiler.alloc_ir(IR {
         next: Some(dst),
-        instr: IRI::Add {
-            dst: compiler.get_reg(Register::InputOffset),
-            src: compiler.get_reg(Register::InputOffset),
-            imm: 1,
-        },
+        instr: IRI::AddImm { dst: compiler.get_reg(Register::InputOffset), imm: 1 },
         offset: usize::MAX,
     }))
 }
@@ -229,6 +313,7 @@ fn transform_concat<'a>(
     compiler: &mut Compiler<'a>,
     dst: IRCell<'a>,
     hirs: &[Hir],
+    capture_groups: &mut Vec<(IRRegCell<'a>, IRRegCell<'a>), &'a Arena>,
 ) -> Result<IRCell<'a>, String> {
     fn is_lowercase_literal(hir: &Hir) -> Option<u8> {
         if let HirKind::Class(Class::Bytes(class)) = hir.kind()
@@ -274,7 +359,7 @@ fn transform_concat<'a>(
             let str = compiler.intern_string(&str);
             compiler.alloc_iri(IRI::If { condition: Condition::PrefixInsensitive(str), then: dst })
         } else {
-            transform(compiler, dst, hir)?
+            transform(compiler, dst, hir, capture_groups)?
         };
         if first.is_none() {
             first = Some(src);
@@ -297,12 +382,13 @@ fn transform_alt<'a>(
     compiler: &mut Compiler<'a>,
     dst: IRCell<'a>,
     hirs: &[Hir],
+    capture_groups: &mut Vec<(IRRegCell<'a>, IRRegCell<'a>), &'a Arena>,
 ) -> Result<IRCell<'a>, String> {
     let mut first: Option<IRCell<'a>> = None;
     let mut last: Option<IRCell<'a>> = None;
 
     for hir in hirs {
-        let node = transform(compiler, dst, hir)?;
+        let node = transform(compiler, dst, hir, capture_groups)?;
         if first.is_none() {
             first = Some(node);
         }

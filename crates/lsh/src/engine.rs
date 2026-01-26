@@ -1,6 +1,35 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! VM bytecode interpreter.
+//!
+//! ## Register semantics
+//!
+//! - `off` advances only on successful matches (charset/prefix). Failed matches leave it alone.
+//!   This is why the frontend emits backup/restore pairs around regex chains.
+//! - `hs` (highlight start) is updated by user code, not automatically. `flush` emits `[hs, off)`.
+//! - `hk` (highlight kind) is just a u32 index into the highlight kind table.
+//!
+//! ## Charset encoding
+//!
+//! Charsets are 256-bit bitmaps stored as `[u16; 16]`. The encoding is transposed for SIMD:
+//! `bitmap[lo_nibble] & (1 << hi_nibble)` tests if byte `(hi_nibble << 4) | lo_nibble` is set.
+//! See `in_set()`. This layout allows parallel lookup of multiple bytes using pshufb.
+//!
+//! ## Performance notes
+//!
+//! - The main loop is `unsafe` with `get_unchecked` everywhere. Profile before "cleaning" it up.
+//! - `charset_gobble` is the hot path. The TODO references a SIMD approach that could help.
+//! - `inlined_memcmp` exists because `slice::starts_with` didn't inline well. Re-check occasionally.
+//!
+//! ## Gotchas
+//!
+//! - `Return` with empty stack resets the VM to entrypoint and clears registers. This is how
+//!   the DSL returns to the "idle" state between tokens.
+//! - `AwaitInput` only breaks the loop if `off >= line.len()`. If not at EOL, it's a no-op.
+//!   This allows the DSL to say "wait for more input OR continue if there is some".
+//! - The result always has a sentinel span at `line.len()`. Consumers can rely on this.
+
 use std::fmt::Debug;
 use std::mem;
 use std::path::Path;
@@ -9,9 +38,13 @@ use stdext::arena::{Arena, scratch_arena};
 
 use crate::compiler::Registers;
 
+/// A compiled language definition with its bytecode entrypoint.
 pub struct Language {
+    /// Unique identifier (e.g., "rust", "markdown").
     pub id: &'static str,
+    /// Human-readable display name.
     pub name: &'static str,
+    /// Bytecode address where execution begins for this language.
     pub entrypoint: u32,
 }
 
@@ -21,9 +54,14 @@ impl PartialEq for &'static Language {
     }
 }
 
+/// A highlight span indicating that text from `start` to the next span has the given `kind`.
+///
+/// Spans are half-open: `[start, next.start)`. The final span in a line extends to EOL.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Higlight<T> {
+    /// Byte offset where this highlight begins.
     pub start: usize,
+    /// The token/highlight type (e.g., keyword, string, comment).
     pub kind: T,
 }
 
@@ -33,27 +71,41 @@ impl<T: Debug> Debug for Higlight<T> {
     }
 }
 
+/// The bytecode interpreter for syntax highlighting.
+///
+/// Maintains execution state (registers, call stack) across lines. Use [`Engine::snapshot`]
+/// and [`Engine::restore`] to save/restore state for incremental re-highlighting.
 #[derive(Clone)]
-pub struct Engine {
-    assembly: &'static [u8],
-    strings: &'static [&'static str],
-    charsets: &'static [[u16; 16]],
+pub struct Engine<'pa, 'ps, 'pc> {
+    /// Compiled bytecode.
+    assembly: &'pa [u8],
+    /// String table for prefix matching instructions.
+    strings: &'ps [&'ps str],
+    /// Charset bitmaps for character class matching (16 u16s = 256 bits).
+    charsets: &'pc [[u16; 16]],
+    /// Bytecode address to jump to on reset (after `Return` with empty stack).
     entrypoint: u32,
+    /// Call stack for `Call`/`Return` instructions.
     stack: Vec<u32>,
+    /// VM registers (pc, off, hs, hk, and general purpose).
     registers: Registers,
 }
 
+/// Snapshot of engine state for incremental re-highlighting.
+///
+/// Save with [`Engine::snapshot`], restore with [`Engine::restore`].
+/// This allows re-highlighting from a known state when only part of a file changes.
 #[derive(Clone)]
 pub struct EngineState {
     stack: Vec<u32>,
     registers: Registers,
 }
 
-impl Engine {
+impl<'pa, 'ps, 'pc> Engine<'pa, 'ps, 'pc> {
     pub fn new(
-        assembly: &'static [u8],
-        strings: &'static [&'static str],
-        charsets: &'static [[u16; 16]],
+        assembly: &'pa [u8],
+        strings: &'ps [&'ps str],
+        charsets: &'pc [[u16; 16]],
         entrypoint: u32,
     ) -> Self {
         Engine {
@@ -75,6 +127,18 @@ impl Engine {
         self.registers = state.registers;
     }
 
+    /// Parse a single line and return highlight spans.
+    ///
+    /// Executes bytecode until the line is fully consumed or a `Return` resets the VM.
+    /// The returned spans partition the line into highlighted regions.
+    ///
+    /// # Arguments
+    /// * `arena` - Allocator for the result vector
+    /// * `line` - The line bytes to highlight (without trailing newline)
+    ///
+    /// # Returns
+    /// A vector of [`Higlight`] spans. Always contains at least two spans:
+    /// one at offset 0 and one at `line.len()` as a sentinel.
     pub fn parse_next_line<'a, T: PartialEq + TryFrom<u32>>(
         &mut self,
         arena: &'a Arena,
@@ -86,6 +150,10 @@ impl Engine {
         self.registers.off = 0;
         self.registers.hs = 0;
 
+        // By default, any line starts with HighlightKind::Other.
+        // If the DSL yields anything, this will be overwritten.
+        res.push(Higlight { start: 0, kind: unsafe { mem::zeroed() } });
+
         loop {
             unsafe {
                 let pc = self.registers.pc as usize;
@@ -95,40 +163,40 @@ impl Engine {
                 match op {
                     0 => {
                         // Mov { dst: Register, src: Register }
-                        let (dst, src) = self.read_dst_src();
+                        let (dst, src) = self.read_reg_pair();
                         let s = self.registers.get(src);
                         self.registers.set(dst, s);
                     }
                     1 => {
                         // Add { dst: Register, src: Register }
-                        let (dst, src) = self.read_dst_src();
+                        let (dst, src) = self.read_reg_pair();
                         let d = self.registers.get(dst);
                         let s = self.registers.get(src);
                         self.registers.set(dst, d.saturating_add(s));
                     }
                     2 => {
                         // Sub { dst: Register, src: Register }
-                        let (dst, src) = self.read_dst_src();
+                        let (dst, src) = self.read_reg_pair();
                         let d = self.registers.get(dst);
                         let s = self.registers.get(src);
                         self.registers.set(dst, d.saturating_sub(s));
                     }
                     3 => {
                         // MovImm { dst: Register, imm: u32 }
-                        let (dst, _) = self.read_dst_src();
+                        let (dst, _) = self.read_reg_pair();
                         let imm = self.read::<u32>();
                         self.registers.set(dst, imm);
                     }
                     4 => {
                         // AddImm { dst: Register, imm: u32 }
-                        let (dst, _) = self.read_dst_src();
+                        let (dst, _) = self.read_reg_pair();
                         let imm = self.read::<u32>();
                         let d = self.registers.get(dst);
                         self.registers.set(dst, d.saturating_add(imm));
                     }
                     5 => {
                         // SubImm { dst: Register, imm: u32 }
-                        let (dst, _) = self.read_dst_src();
+                        let (dst, _) = self.read_reg_pair();
                         let imm = self.read::<u32>();
                         let d = self.registers.get(dst);
                         self.registers.set(dst, d.saturating_sub(imm));
@@ -152,7 +220,7 @@ impl Engine {
 
                     8 => {
                         // JumpEQ { lhs: Register, rhs: Register, tgt: u32 }
-                        let (dst, src) = self.read_dst_src();
+                        let (dst, src) = self.read_reg_pair();
                         let tgt = self.read::<u32>();
                         if self.registers.get(dst) == self.registers.get(src) {
                             self.registers.pc = tgt;
@@ -160,7 +228,7 @@ impl Engine {
                     }
                     9 => {
                         // JumpNE { lhs: Register, rhs: Register, tgt: u32 }
-                        let (dst, src) = self.read_dst_src();
+                        let (dst, src) = self.read_reg_pair();
                         let tgt = self.read::<u32>();
                         if self.registers.get(dst) != self.registers.get(src) {
                             self.registers.pc = tgt;
@@ -168,7 +236,7 @@ impl Engine {
                     }
                     10 => {
                         // JumpLT { lhs: Register, rhs: Register, tgt: u32 }
-                        let (dst, src) = self.read_dst_src();
+                        let (dst, src) = self.read_reg_pair();
                         let tgt = self.read::<u32>();
                         if self.registers.get(dst) < self.registers.get(src) {
                             self.registers.pc = tgt;
@@ -176,7 +244,7 @@ impl Engine {
                     }
                     11 => {
                         // JumpLE { lhs: Register, rhs: Register, tgt: u32 }
-                        let (dst, src) = self.read_dst_src();
+                        let (dst, src) = self.read_reg_pair();
                         let tgt = self.read::<u32>();
                         if self.registers.get(dst) <= self.registers.get(src) {
                             self.registers.pc = tgt;
@@ -184,7 +252,7 @@ impl Engine {
                     }
                     12 => {
                         // JumpGT { lhs: Register, rhs: Register, tgt: u32 }
-                        let (dst, src) = self.read_dst_src();
+                        let (dst, src) = self.read_reg_pair();
                         let tgt = self.read::<u32>();
                         if self.registers.get(dst) > self.registers.get(src) {
                             self.registers.pc = tgt;
@@ -192,7 +260,7 @@ impl Engine {
                     }
                     13 => {
                         // JumpGE { lhs: Register, rhs: Register, tgt: u32 }
-                        let (dst, src) = self.read_dst_src();
+                        let (dst, src) = self.read_reg_pair();
                         let tgt = self.read::<u32>();
                         if self.registers.get(dst) >= self.registers.get(src) {
                             self.registers.pc = tgt;
@@ -246,8 +314,10 @@ impl Engine {
 
                     18 => {
                         // FlushHighlight
-                        let start = self.registers.hs as usize;
-                        let kind = self.registers.hk.try_into().unwrap_unchecked();
+                        let (kind, _) = self.read_reg_pair();
+                        let kind = self.registers.get(kind);
+                        let kind = kind.try_into().unwrap_unchecked();
+                        let start = (self.registers.hs as usize).min(line.len());
 
                         if let Some(last) = res.last_mut()
                             && (last.start == start || last.kind == kind)
@@ -272,10 +342,7 @@ impl Engine {
             }
         }
 
-        if res.last().is_none_or(|last| last.start < line.len()) {
-            let start = line.len().min(self.registers.off as usize);
-            res.push(Higlight { start, kind: unsafe { mem::zeroed() } });
-        }
+        // Ensure that there's a past-the-end highlight.
         if res.last().is_none_or(|last| last.start < line.len()) {
             res.push(Higlight { start: line.len(), kind: unsafe { mem::zeroed() } });
         }
@@ -374,10 +441,10 @@ impl Engine {
     }
 
     #[inline]
-    fn read_dst_src(&mut self) -> (usize, usize) {
-        let dst_src = self.read::<u8>();
-        let dst = (dst_src & 0xf) as usize;
-        let src = (dst_src >> 4) as usize;
+    fn read_reg_pair(&mut self) -> (usize, usize) {
+        let reg_pair = self.read::<u8>();
+        let dst = (reg_pair & 0xf) as usize;
+        let src = (reg_pair >> 4) as usize;
         (dst, src)
     }
 }

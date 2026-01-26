@@ -1,6 +1,50 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! IR optimization passes, run before register allocation.
+//!
+//! ## Pass order matters
+//!
+//! 1. `optimize_noop` - removes noop nodes by rewiring `.next` pointers
+//! 2. `optimize_redundant_offset_backup_restore` - removes pointless save/restore pairs
+//! 3. `optimize_highlight_kind_values` - renumbers highlight kinds for prettier output
+//!
+//! Noop removal must run first because other passes check for specific instruction sequences.
+//!
+//! ## Offset backup/restore optimization
+//!
+//! The frontend emits patterns like:
+//! ```text
+//! Add { off → backup }      // save position
+//! If { /pattern1/ }         // try pattern 1
+//! Add { backup → off }      // restore position (redundant!)
+//! If { /pattern2/ }         // try pattern 2
+//! Add { backup → off }      // restore position (redundant!)
+//! ```
+//!
+//! This is redundant because `If` conditions don't advance `off` on failure. The optimizer:
+//! 1. Looks for `Add { off → vreg }` (backup)
+//! 2. Follows the chain looking for `Add { vreg → off }` (restore) after `If` nodes
+//! 3. Removes the restore nodes
+//! 4. Then removes the backup if the vreg is never read
+//!
+//! ## Dead store elimination
+//!
+//! After removing restore nodes, some backup nodes become dead stores (vreg never read).
+//! The pass builds a set of all read vregs, then removes `Add` instructions whose dst
+//! vreg isn't in that set.
+//!
+//! ## Highlight kind renumbering
+//!
+//! Purely cosmetic: sorts highlight kinds alphabetically (with "other" first) and assigns
+//! contiguous values. Updates all `Add { dst=hk, imm=... }` instructions to use new values.
+//!
+//! ## TODO
+//!
+//! - Could do copy propagation: if `vreg1 = vreg2`, replace all uses of vreg1 with vreg2.
+//! - Could merge consecutive `Add { off, off, 1 }` instructions.
+//! - Could eliminate unreachable code after `Return`.
+
 use std::cell::RefMut;
 use std::iter::repeat_n;
 use std::ptr;
@@ -83,7 +127,7 @@ fn optimize_redundant_offset_backup_restore<'a>(compiler: &mut Compiler<'a>) {
         for current_cell in compiler.visit_nodes_from(function.body) {
             // First, filter down to nodes that assign the `off` to a virtual register.
             if let mut save = current_cell.borrow_mut()
-                && let IRI::Add { dst: backup_reg, src, imm: 0 } = save.instr
+                && let IRI::Mov { dst: backup_reg, src } = save.instr
                 && ptr::eq(src, off_reg)
                 && backup_reg.borrow().physical.is_none()
             {
@@ -95,7 +139,7 @@ fn optimize_redundant_offset_backup_restore<'a>(compiler: &mut Compiler<'a>) {
                     && matches!(cond.instr, IRI::If { .. })
                     && let Some(restore) = cond.next
                     && let mut restore = restore.borrow_mut()
-                    && matches!(restore.instr, IRI::Add { dst, src, imm: 0 } if ptr::eq(dst, off_reg) && ptr::eq(src, backup_reg))
+                    && matches!(restore.instr, IRI::Mov { dst, src } if ptr::eq(dst, off_reg) && ptr::eq(src, backup_reg))
                 {
                     cond.next = restore.next;
                     next_cond = restore.next;
@@ -105,12 +149,30 @@ fn optimize_redundant_offset_backup_restore<'a>(compiler: &mut Compiler<'a>) {
     }
 
     // Remove pointless offset backups.
-    compiler.count_register_uses();
+    // A backup is pointless if the destination vreg is never read.
     for function in &compiler.functions {
+        // First, collect all vregs that are read anywhere in the function.
+        let mut used_vregs = HashSet::new();
+        for current_cell in compiler.visit_nodes_from(function.body) {
+            let current = current_cell.borrow();
+            match current.instr {
+                IRI::Mov { src, .. } => {
+                    let id = src.borrow().id;
+                    used_vregs.insert(id);
+                }
+                IRI::If { condition: Condition::Cmp { lhs, rhs, .. }, .. } => {
+                    used_vregs.insert(lhs.borrow().id);
+                    used_vregs.insert(rhs.borrow().id);
+                }
+                _ => {}
+            }
+        }
+
+        // Now remove dead stores (assignments to vregs that are never read).
         for current_cell in compiler.visit_nodes_from(function.body) {
             // First, filter down to nodes that assign the `off` to a virtual register.
             if let mut cell = current_cell.borrow_mut()
-                && let IRI::Add { dst, src, imm: 0 } = cell.instr
+                && let IRI::Mov { dst, src } = cell.instr
                 && let src = src.borrow()
                 && let dst = dst.borrow()
                 // TODO: Technically we could also optimize vreg --> vreg assignments, but for that we
@@ -119,7 +181,7 @@ fn optimize_redundant_offset_backup_restore<'a>(compiler: &mut Compiler<'a>) {
                 && src.physical.is_some()
                 // We can't optimize physical register --> physical register assignments.
                 && dst.physical.is_none()
-                && dst.read_count == 0
+                && !used_vregs.contains(&dst.id)
             {
                 cell.instr = IRI::Noop;
             }
@@ -168,16 +230,12 @@ fn optimize_highlight_kind_values<'a>(compiler: &mut Compiler<'a>) {
         hk.value = idx;
     }
 
-    let hk_dst = compiler.get_reg(Register::HighlightKind);
-
     for function in &compiler.functions {
         for current in compiler.visit_nodes_from(function.body) {
             let mut current = current.borrow_mut();
 
-            if let IRI::Add { dst, src, imm } = &mut current.instr
-                && ptr::eq(*dst, hk_dst)
-            {
-                *imm = mapping[*imm as usize];
+            if let IRI::MovKind { dst, kind } = &mut current.instr {
+                *kind = mapping[*kind as usize];
             }
         }
     }

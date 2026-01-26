@@ -2022,10 +2022,12 @@ impl TextBuffer {
                             'block: {
                                 let color = match kind {
                                     HighlightKind::Other => break 'block,
+
                                     HighlightKind::Comment => IndexedColor::Green,
                                     HighlightKind::Method => IndexedColor::BrightYellow,
                                     HighlightKind::String => IndexedColor::BrightRed,
                                     HighlightKind::Variable => IndexedColor::BrightCyan,
+
                                     HighlightKind::ConstantLanguage => IndexedColor::BrightBlue,
                                     HighlightKind::ConstantNumeric => IndexedColor::BrightGreen,
                                     HighlightKind::KeywordControl => IndexedColor::BrightMagenta,
@@ -2039,7 +2041,7 @@ impl TextBuffer {
                                     HighlightKind::MarkupLink => break 'block,
                                     HighlightKind::MarkupList => IndexedColor::BrightBlue,
                                     HighlightKind::MarkupStrikethrough => break 'block,
-                                    HighlightKind::MetaDiffHeader => IndexedColor::BrightBlue,
+                                    HighlightKind::MetaHeader => IndexedColor::BrightBlue,
                                 };
                                 fb.blend_fg(target, fb.indexed(color));
                             }

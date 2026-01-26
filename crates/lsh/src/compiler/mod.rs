@@ -1,6 +1,48 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! Compiler core: IR definitions, instruction encoding, and shared infrastructure.
+//!
+//! ## IR representation
+//!
+//! The IR is a graph of `RefCell<IR>` nodes linked via `next` and `then` pointers.
+//! This isn't a traditional SSA or basic block representation - it's more like a
+//! flowchart where each node is one instruction. The `offset` field is set during
+//! codegen to the final bytecode address.
+//!
+//! The only IR instruction that does real work is `Add { dst, src, imm }` which computes
+//! `dst = src + imm`. Everything else is control flow (`If`, `Call`, `Return`) or
+//! side effects (`Flush`, `AwaitInput`).
+//!
+//! ## Register architecture
+//!
+//! - 5 physical registers with fixed semantics (`zero`, `pc`, `off`, `hs`, `hk`)
+//! - 11 user registers (`x5`-`x15`) for general use
+//! - Virtual registers (vreg IDs >= 16) get allocated to physical ones by the backend
+//!
+//! The `IRReg.physical` field starts as `None` for vregs and gets filled in by regalloc.
+//! For physical registers, it's set during `Compiler::new()`.
+//!
+//! ## Charset representation
+//!
+//! `Charset` is a 256-bit bitmap (`[bool; 256]`). The engine uses a transposed `[u16; 16]`
+//! layout for SIMD reasons - see `generator.rs` where the conversion happens.
+//!
+//! ## Instruction encoding
+//!
+//! Variable-length encoding, 1-9 bytes per instruction. See `Instruction::encode/decode`.
+//! The `address_offset()` method returns where within an instruction the jump target lives,
+//! used by the backend's relocation system.
+//!
+//! ## Quirks
+//!
+//! - `IRI::Add` with `src=zero` is "load immediate". `imm=u32::MAX` is special-cased in
+//!   the DSL to mean "end of line" offset.
+//! - `TreeVisitor` does BFS, which is fine for iteration but **not** for linearization.
+//!   The backend has its own DFS traversal for liveness analysis.
+//! - `Charset::covers_all()` returning true means the charset matches every byte, which
+//!   is used to skip the "fast forward" optimization in loops.
+
 mod backend;
 mod frontend;
 mod generator;
@@ -40,6 +82,8 @@ pub struct CompileError {
     pub column: usize,
     pub message: String,
 }
+
+impl std::error::Error for CompileError {}
 
 impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -102,14 +146,8 @@ impl<'a> Compiler<'a> {
         self.alloc_iri(IRI::Noop)
     }
 
-    fn chain_iri(&self, prev: IRCell<'a>, instr: IRI<'a>) -> IRCell<'a> {
-        let ir = self.arena.alloc_uninit().write(RefCell::new(IR {
-            next: None,
-            instr,
-            offset: usize::MAX,
-        }));
-        prev.borrow_mut().set_next(ir);
-        ir
+    fn build_chain<'s>(&'s self) -> IRChainBuilder<'a, 's> {
+        IRChainBuilder { compiler: self, span: None }
     }
 
     fn get_reg(&self, reg: Register) -> IRRegCell<'a> {
@@ -147,41 +185,6 @@ impl<'a> Compiler<'a> {
         let mut stack = VecDeque::new();
         stack.push_back(root);
         TreeVisitor { current: None, stack, visited: Default::default() }
-    }
-
-    fn count_register_uses(&self) {
-        for function in &self.functions {
-            for node in self.visit_nodes_from(function.body) {
-                let node = node.borrow();
-                match node.instr {
-                    IRI::Add { dst, src, imm } => {
-                        dst.borrow_mut().read_count = 0;
-                        src.borrow_mut().read_count = 0;
-                    }
-                    IRI::If { condition: Condition::Cmp { lhs, rhs, .. }, .. } => {
-                        lhs.borrow_mut().read_count = 0;
-                        rhs.borrow_mut().read_count = 0;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        for function in &self.functions {
-            for node in self.visit_nodes_from(function.body) {
-                let node = node.borrow();
-                match node.instr {
-                    IRI::Add { dst, src, imm } => {
-                        src.borrow_mut().read_count += 1;
-                    }
-                    IRI::If { condition: Condition::Cmp { lhs, rhs, .. }, .. } => {
-                        lhs.borrow_mut().read_count += 1;
-                        rhs.borrow_mut().read_count += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
     }
 
     /// Collect all "interesting" characters from conditions in a loop body.
@@ -261,37 +264,27 @@ impl<'a> Compiler<'a> {
                     IRI::Noop => {
                         _ = write!(output, "[{offset}: noop]");
                     }
-                    IRI::Add { dst, src, imm } => {
+                    IRI::Mov { dst, src } => {
                         let src = src.borrow();
                         let dst = dst.borrow();
-
-                        _ = write!(output, "[\"{offset}: {dst:?} = ");
-
-                        if dst.id == Register::HighlightKind as u32
-                            && let Some(hk) = self.highlight_kinds.iter().find(|hk| hk.value == imm)
-                        {
-                            _ = write!(output, "{} ({})", hk.value, hk.identifier);
-                        } else {
-                            match (src.id, imm) {
-                                (0, 0) => {
-                                    _ = write!(output, "0");
-                                }
-                                (0, u32::MAX) => {
-                                    _ = write!(output, "max");
-                                }
-                                (0, _) => {
-                                    _ = write!(output, "{imm}");
-                                }
-                                (_, 0) => {
-                                    _ = write!(output, "{src:?}");
-                                }
-                                _ => {
-                                    _ = write!(output, "{src:?} + {imm}");
-                                }
-                            }
-                        }
-
-                        output.push_str("\"]");
+                        _ = write!(output, "[\"{offset}: {dst:?} = {src:?}\"]");
+                    }
+                    IRI::MovImm { dst, imm } => {
+                        let dst = dst.borrow();
+                        _ = write!(output, "[\"{offset}: {dst:?} = {imm}\"]");
+                    }
+                    IRI::MovKind { dst, kind } => {
+                        let dst = dst.borrow();
+                        let kind = self
+                            .highlight_kinds
+                            .iter()
+                            .find(|hk| hk.value == kind)
+                            .map_or("???", |hk| hk.identifier);
+                        _ = write!(output, "[\"{offset}: {dst:?} = {kind}\"]");
+                    }
+                    IRI::AddImm { dst, imm } => {
+                        let dst = dst.borrow();
+                        _ = write!(output, "[\"{offset}: {dst:?} += {imm}\"]");
                     }
                     IRI::If { condition, then } => {
                         _ = write!(output, "{{\"{offset}: ");
@@ -322,7 +315,7 @@ impl<'a> Compiler<'a> {
                     IRI::Return => {
                         _ = write!(output, "[{offset}: return]");
                     }
-                    IRI::Flush => {
+                    IRI::Flush { kind } => {
                         _ = write!(output, "[{offset}: flush]");
                     }
                     IRI::AwaitInput => {
@@ -448,7 +441,7 @@ struct IR<'a> {
 
 impl<'a> fmt::Display for IR<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "i{}", self.offset)
+        write!(f, "i{self:p}")
     }
 }
 
@@ -458,18 +451,20 @@ type IRCell<'a> = &'a RefCell<IR<'a>>;
 #[derive(Debug, Clone, Copy)]
 enum IRI<'a> {
     Noop,
-    Add { dst: IRRegCell<'a>, src: IRRegCell<'a>, imm: u32 },
+    Mov { dst: IRRegCell<'a>, src: IRRegCell<'a> },
+    MovImm { dst: IRRegCell<'a>, imm: u32 },
+    MovKind { dst: IRRegCell<'a>, kind: u32 },
+    AddImm { dst: IRRegCell<'a>, imm: u32 },
     If { condition: Condition<'a>, then: IRCell<'a> },
     Call { name: &'a str },
     Return,
-    Flush,
+    Flush { kind: IRRegCell<'a> },
     AwaitInput,
 }
 
 #[derive(Default)]
 pub struct IRReg {
     id: u32,
-    read_count: i32,
     physical: Option<Register>,
 }
 
@@ -477,7 +472,7 @@ pub type IRRegCell<'a> = &'a RefCell<IRReg>;
 
 impl IRReg {
     fn new(id: u32) -> Self {
-        IRReg { id, read_count: 0, physical: None }
+        IRReg { id, physical: None }
     }
 }
 
@@ -490,6 +485,40 @@ impl fmt::Debug for IRReg {
         } else {
             write!(f, "v{}", self.id)
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IRSpan<'a> {
+    pub first: IRCell<'a>,
+    pub last: IRCell<'a>,
+}
+
+impl<'a> IRSpan<'a> {
+    pub fn single(node: IRCell<'a>) -> Self {
+        Self { first: node, last: node }
+    }
+}
+
+struct IRChainBuilder<'a, 's> {
+    compiler: &'s Compiler<'a>,
+    span: Option<IRSpan<'a>>,
+}
+
+impl<'a, 's> IRChainBuilder<'a, 's> {
+    fn append(&mut self, instr: IRI<'a>) -> &mut Self {
+        let node = self.compiler.alloc_iri(instr);
+        if let Some(span) = &mut self.span {
+            span.last.borrow_mut().set_next(node);
+            span.last = node;
+        } else {
+            self.span = Some(IRSpan::single(node));
+        }
+        self
+    }
+
+    fn build(&self) -> IRSpan<'a> {
+        self.span.unwrap_or_else(|| IRSpan::single(self.compiler.alloc_noop()))
     }
 }
 
@@ -706,11 +735,11 @@ pub struct Entrypoint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Register {
-    Zero,
     ProgramCounter,
     InputOffset,
     HighlightStart,
-    HighlightKind,
+    X3,
+    X4,
     X5,
     X6,
     X7,
@@ -735,11 +764,11 @@ impl Register {
 
     fn mnemonic(&self) -> &'static str {
         match self {
-            Register::Zero => "zero",
             Register::ProgramCounter => "pc",
             Register::InputOffset => "off",
             Register::HighlightStart => "hs",
-            Register::HighlightKind => "hk",
+            Register::X3 => "x3",
+            Register::X4 => "x4",
             Register::X5 => "x5",
             Register::X6 => "x6",
             Register::X7 => "x7",
@@ -764,11 +793,11 @@ impl fmt::Display for Register {
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct Registers {
-    pub zero: u32, // x0 = Zero
-    pub pc: u32,   // x1 = ProgramCounter
-    pub off: u32,  // x2 = InputOffset
-    pub hs: u32,   // z3 = HighlightStart
-    pub hk: u32,   // x4 = HighlightKind
+    pub pc: u32,  // x0 = ProgramCounter
+    pub off: u32, // x1 = InputOffset
+    pub hs: u32,  // x2 = HighlightStart
+    pub x3: u32,
+    pub x4: u32,
     pub x5: u32,
     pub x6: u32,
     pub x7: u32,
@@ -880,7 +909,7 @@ pub enum Instruction {
     JumpIfMatchPrefixInsensitive { idx: u32, tgt: u32 },
 
     // Flushes the current HighlightKind to the output.
-    FlushHighlight,
+    FlushHighlight { kind: Register },
 
     // Awaits more input to be available.
     AwaitInput,
@@ -889,6 +918,10 @@ pub enum Instruction {
 impl Instruction {
     pub fn address_offset(&self) -> Option<usize> {
         match *self {
+            Instruction::MovImm { .. }
+            | Instruction::AddImm { .. }
+            | Instruction::SubImm { .. } => Some(2), // opcode + dst
+
             Instruction::Call { .. } => Some(1), // opcode
 
             Instruction::JumpEQ { .. }
@@ -904,22 +937,18 @@ impl Instruction {
             | Instruction::JumpIfMatchPrefix { .. }
             | Instruction::JumpIfMatchPrefixInsensitive { .. } => Some(5), // opcode + idx
 
-            Instruction::MovImm { .. }
-            | Instruction::AddImm { .. }
-            | Instruction::SubImm { .. } => Some(2), // opcode + dst
-
             _ => None,
         }
     }
 
     #[allow(clippy::identity_op)]
     pub fn encode<'a>(&self, arena: &'a Arena) -> Vec<u8, &'a Arena> {
-        fn enc_dst_src(dst: Register, src: Register) -> u8 {
-            ((src as u8) << 4) | (dst as u8)
+        fn enc_reg_pair(lo: Register, hi: Register) -> u8 {
+            ((hi as u8) << 4) | (lo as u8)
         }
 
-        fn enc_dst(dst: Register) -> u8 {
-            dst as u8
+        fn enc_reg_single(lo: Register) -> u8 {
+            lo as u8
         }
 
         fn enc_u16(val: u16) -> [u8; 2] {
@@ -938,12 +967,12 @@ impl Instruction {
             Instruction::Mov { dst, src }
             | Instruction::Add { dst, src }
             | Instruction::Sub { dst, src } => {
-                bytes.push(enc_dst_src(dst, src));
+                bytes.push(enc_reg_pair(dst, src));
             }
             Instruction::MovImm { dst, imm }
             | Instruction::AddImm { dst, imm }
             | Instruction::SubImm { dst, imm } => {
-                bytes.push(enc_dst(dst));
+                bytes.push(enc_reg_single(dst));
                 bytes.extend_from_slice(&enc_u32(imm));
             }
 
@@ -958,7 +987,7 @@ impl Instruction {
             | Instruction::JumpLE { lhs, rhs, tgt }
             | Instruction::JumpGT { lhs, rhs, tgt }
             | Instruction::JumpGE { lhs, rhs, tgt } => {
-                bytes.push(enc_dst_src(lhs, rhs));
+                bytes.push(enc_reg_pair(lhs, rhs));
                 bytes.extend_from_slice(&enc_u32(tgt));
             }
 
@@ -972,7 +1001,9 @@ impl Instruction {
                 bytes.extend_from_slice(&enc_u32(tgt));
             }
 
-            Instruction::FlushHighlight => {}
+            Instruction::FlushHighlight { kind } => {
+                bytes.push(enc_reg_single(kind));
+            }
             Instruction::AwaitInput => {}
         }
 
@@ -980,13 +1011,13 @@ impl Instruction {
     }
 
     pub fn decode(bytes: &[u8]) -> (Self, usize) {
-        fn dec_dst_src(b: u8) -> (Register, Register) {
-            let src = Register::from_usize((b >> 4) as usize);
-            let dst = Register::from_usize((b & 0xF) as usize);
-            (dst, src)
+        fn dec_reg_pair(b: u8) -> (Register, Register) {
+            let hi = Register::from_usize((b >> 4) as usize);
+            let lo = Register::from_usize((b & 0xF) as usize);
+            (lo, hi)
         }
 
-        fn dec_dst(b: u8) -> Register {
+        fn dec_reg_single(b: u8) -> Register {
             Register::from_usize(b as usize)
         }
 
@@ -997,61 +1028,61 @@ impl Instruction {
         let opcode = bytes[0];
         match opcode {
             0 => {
-                let (dst, src) = dec_dst_src(bytes[1]);
+                let (dst, src) = dec_reg_pair(bytes[1]);
                 (Instruction::Mov { dst, src }, 2)
             }
             1 => {
-                let (dst, src) = dec_dst_src(bytes[1]);
+                let (dst, src) = dec_reg_pair(bytes[1]);
                 (Instruction::Add { dst, src }, 2)
             }
             2 => {
-                let (dst, src) = dec_dst_src(bytes[1]);
+                let (dst, src) = dec_reg_pair(bytes[1]);
                 (Instruction::Sub { dst, src }, 2)
             }
             3 => {
-                let dst = dec_dst(bytes[1]);
+                let dst = dec_reg_single(bytes[1]);
                 let imm = dec_u32(&bytes[2..]);
                 (Instruction::MovImm { dst, imm }, 6)
             }
             4 => {
-                let dst = dec_dst(bytes[1]);
+                let dst = dec_reg_single(bytes[1]);
                 let imm = dec_u32(&bytes[2..]);
                 (Instruction::AddImm { dst, imm }, 6)
             }
             5 => {
-                let dst = dec_dst(bytes[1]);
+                let dst = dec_reg_single(bytes[1]);
                 let imm = dec_u32(&bytes[2..]);
                 (Instruction::SubImm { dst, imm }, 6)
             }
             6 => (Instruction::Call { tgt: dec_u32(&bytes[1..]) }, 5),
             7 => (Instruction::Return, 1),
             8 => {
-                let (lhs, rhs) = dec_dst_src(bytes[1]);
+                let (lhs, rhs) = dec_reg_pair(bytes[1]);
                 let tgt = dec_u32(&bytes[2..]);
                 (Instruction::JumpEQ { lhs, rhs, tgt }, 6)
             }
             9 => {
-                let (lhs, rhs) = dec_dst_src(bytes[1]);
+                let (lhs, rhs) = dec_reg_pair(bytes[1]);
                 let tgt = dec_u32(&bytes[2..]);
                 (Instruction::JumpNE { lhs, rhs, tgt }, 6)
             }
             10 => {
-                let (lhs, rhs) = dec_dst_src(bytes[1]);
+                let (lhs, rhs) = dec_reg_pair(bytes[1]);
                 let tgt = dec_u32(&bytes[2..]);
                 (Instruction::JumpLT { lhs, rhs, tgt }, 6)
             }
             11 => {
-                let (lhs, rhs) = dec_dst_src(bytes[1]);
+                let (lhs, rhs) = dec_reg_pair(bytes[1]);
                 let tgt = dec_u32(&bytes[2..]);
                 (Instruction::JumpLE { lhs, rhs, tgt }, 6)
             }
             12 => {
-                let (lhs, rhs) = dec_dst_src(bytes[1]);
+                let (lhs, rhs) = dec_reg_pair(bytes[1]);
                 let tgt = dec_u32(&bytes[2..]);
                 (Instruction::JumpGT { lhs, rhs, tgt }, 6)
             }
             13 => {
-                let (lhs, rhs) = dec_dst_src(bytes[1]);
+                let (lhs, rhs) = dec_reg_pair(bytes[1]);
                 let tgt = dec_u32(&bytes[2..]);
                 (Instruction::JumpGE { lhs, rhs, tgt }, 6)
             }
@@ -1071,7 +1102,10 @@ impl Instruction {
                 let tgt = dec_u32(&bytes[5..]);
                 (Instruction::JumpIfMatchPrefixInsensitive { idx, tgt }, 9)
             }
-            18 => (Instruction::FlushHighlight, 1),
+            18 => {
+                let kind = dec_reg_single(bytes[1]);
+                (Instruction::FlushHighlight { kind }, 2)
+            }
             19 => (Instruction::AwaitInput, 1),
             _ => panic!("unknown opcode {opcode}"),
         }
@@ -1116,47 +1150,47 @@ impl Instruction {
                 _ = write!(str, "{_i}subi{i_}   {_r}{dst}{r_}, {_n}{imm}{n_}");
             }
 
-            Instruction::Call { tgt: off } => {
-                _ = write!(str, "{_i}call{i_}   {_a}{off}{a_}");
+            Instruction::Call { tgt } => {
+                _ = write!(str, "{_i}call{i_}   {_a}{tgt}{a_}");
             }
             Instruction::Return => {
                 _ = write!(str, "{_i}ret{i_}");
             }
 
-            Instruction::JumpEQ { lhs, rhs, tgt: off } => {
-                _ = write!(str, "{_i}jeq{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{off}{a_}");
+            Instruction::JumpEQ { lhs, rhs, tgt } => {
+                _ = write!(str, "{_i}jeq{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{tgt}{a_}");
             }
-            Instruction::JumpNE { lhs, rhs, tgt: off } => {
-                _ = write!(str, "{_i}jne{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{off}{a_}");
+            Instruction::JumpNE { lhs, rhs, tgt } => {
+                _ = write!(str, "{_i}jne{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{tgt}{a_}");
             }
-            Instruction::JumpLT { lhs, rhs, tgt: off } => {
-                _ = write!(str, "{_i}jlt{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{off}{a_}");
+            Instruction::JumpLT { lhs, rhs, tgt } => {
+                _ = write!(str, "{_i}jlt{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{tgt}{a_}");
             }
-            Instruction::JumpLE { lhs, rhs, tgt: off } => {
-                _ = write!(str, "{_i}jle{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{off}{a_}");
+            Instruction::JumpLE { lhs, rhs, tgt } => {
+                _ = write!(str, "{_i}jle{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{tgt}{a_}");
             }
-            Instruction::JumpGT { lhs, rhs, tgt: off } => {
-                _ = write!(str, "{_i}jgt{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{off}{a_}");
+            Instruction::JumpGT { lhs, rhs, tgt } => {
+                _ = write!(str, "{_i}jgt{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{tgt}{a_}");
             }
-            Instruction::JumpGE { lhs, rhs, tgt: off } => {
-                _ = write!(str, "{_i}jge{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{off}{a_}");
-            }
-
-            Instruction::JumpIfEndOfLine { tgt: off } => {
-                _ = write!(str, "{_i}jeol{i_}   {_a}{off}{a_}");
-            }
-            Instruction::JumpIfMatchCharset { idx, tgt: off } => {
-                _ = write!(str, "{_i}jc{i_}     {_n}{idx}{n_}, {_a}{off}{a_}");
-            }
-            Instruction::JumpIfMatchPrefix { idx, tgt: off } => {
-                _ = write!(str, "{_i}jp{i_}     {_n}{idx}{n_}, {_a}{off}{a_}");
-            }
-            Instruction::JumpIfMatchPrefixInsensitive { idx, tgt: off } => {
-                _ = write!(str, "{_i}jpi{i_}    {_n}{idx}{n_}, {_a}{off}{a_}");
+            Instruction::JumpGE { lhs, rhs, tgt } => {
+                _ = write!(str, "{_i}jge{i_}    {_r}{lhs}{r_}, {_r}{rhs}{r_}, {_a}{tgt}{a_}");
             }
 
-            Instruction::FlushHighlight => {
-                _ = write!(str, "{_i}flush{i_}");
+            Instruction::JumpIfEndOfLine { tgt } => {
+                _ = write!(str, "{_i}jeol{i_}   {_a}{tgt}{a_}");
+            }
+            Instruction::JumpIfMatchCharset { idx, tgt } => {
+                _ = write!(str, "{_i}jc{i_}     {_n}{idx}{n_}, {_a}{tgt}{a_}");
+            }
+            Instruction::JumpIfMatchPrefix { idx, tgt } => {
+                _ = write!(str, "{_i}jp{i_}     {_n}{idx}{n_}, {_a}{tgt}{a_}");
+            }
+            Instruction::JumpIfMatchPrefixInsensitive { idx, tgt } => {
+                _ = write!(str, "{_i}jpi{i_}    {_n}{idx}{n_}, {_a}{tgt}{a_}");
+            }
+
+            Instruction::FlushHighlight { kind } => {
+                _ = write!(str, "{_i}flush{i_}  {_r}{kind}{r_}");
             }
             Instruction::AwaitInput => {
                 _ = write!(str, "{_i}await{i_}");

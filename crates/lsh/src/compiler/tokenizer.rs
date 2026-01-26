@@ -1,6 +1,28 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+//! Lexer for the LSH DSL.
+//!
+//! ## Token types
+//!
+//! - `Regex(&str)` - content between `/` delimiters, backslash-escaped `/` allowed
+//! - `String(&str)` - content between `"` delimiters, backslash-escaped `"` allowed
+//! - `Submatch(u32)` - `$1`, `$2`, etc. for capture group references
+//! - `Identifier(&str)` - allows dots for hierarchical highlight kinds like `string.quoted`
+//!
+//! ## Quirks
+//!
+//! - Regex and string tokens include escape sequences verbatim. The frontend/regex compiler
+//!   handles unescaping. This means `/\/foo/` tokenizes as `Regex("\\/foo")`.
+//!
+//! - `position()` computes line/column by scanning from the start. Fine for error reporting,
+//!   but don't call it in hot paths.
+//!
+//! - Identifiers can contain dots (e.g., `string.quoted`), which is unusual. This is for
+//!   hierarchical highlight kind names. Affects `is_ident_continuation`.
+//!
+//! - `//` comments are stripped in `skip_whitespace`, not as a separate token.
+
 use std::iter::Peekable;
 use std::str::Chars;
 
@@ -9,8 +31,9 @@ pub enum Token<'a> {
     // Literals
     Identifier(&'a str),
     Integer(u32),
-    Regex(&'a str),
     String(&'a str),
+    Regex(&'a str),
+    Submatch(u32),
 
     // Keywords
     Pub,
@@ -98,6 +121,13 @@ impl<'a> Tokenizer<'a> {
                 ']' => Token::RightBracket,
                 '#' => Token::Hash,
                 ',' => Token::Comma,
+                '$' => {
+                    self.start_pos += 1; // Skip the '$'
+                    match self.read_integer(ch) {
+                        Token::Integer(idx) => Token::Submatch(idx),
+                        other => other,
+                    }
+                }
                 ';' => Token::Semicolon,
                 '"' => self.read_string(),
                 '/' => self.read_regex(),
