@@ -433,6 +433,8 @@ struct Function<'a> {
     public: bool,
 }
 
+type IRCell<'a> = &'a RefCell<IR<'a>>;
+
 // To be honest, I don't think this qualifies as an "intermediate representation",
 // if we compare this to popular compilers. But whatever. It's still intermediate to us.
 #[derive(Debug)]
@@ -441,14 +443,6 @@ struct IR<'a> {
     instr: IRI<'a>,
     offset: usize,
 }
-
-impl<'a> fmt::Display for IR<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "i{self:p}")
-    }
-}
-
-type IRCell<'a> = &'a RefCell<IR<'a>>;
 
 // IRI = Immediate Representation Instruction
 #[derive(Debug, Clone, Copy)]
@@ -465,29 +459,51 @@ enum IRI<'a> {
     AwaitInput,
 }
 
-#[derive(Default)]
-struct IRReg {
-    id: u32,
-    physical: Option<Register>,
+#[derive(Debug, Clone, Copy)]
+enum Condition<'a> {
+    Cmp { lhs: IRRegCell<'a>, rhs: IRRegCell<'a>, op: ComparisonOp },
+    EndOfLine,
+    Charset { cs: &'a Charset, min: u32, max: u32 },
+    Prefix(&'a str),
+    PrefixInsensitive(&'a str),
 }
 
-type IRRegCell<'a> = &'a RefCell<IRReg>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparisonOp {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
 
-impl IRReg {
-    fn new(id: u32) -> Self {
-        IRReg { id, physical: None }
+impl<'a> IR<'a> {
+    fn wants_next(&self) -> bool {
+        if self.next.is_some() {
+            return false;
+        }
+
+        match self.instr {
+            IRI::Mov { dst, .. } | IRI::MovImm { dst, .. }
+                if dst.borrow().id == Register::ProgramCounter as u32 =>
+            {
+                false
+            }
+            IRI::Return => false,
+            _ => true,
+        }
+    }
+
+    fn set_next(&mut self, n: IRCell<'a>) {
+        debug_assert!(self.wants_next());
+        self.next = Some(n);
     }
 }
 
-impl fmt::Debug for IRReg {
+impl<'a> fmt::Display for IR<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(p) = self.physical
-            && self.id < Register::COUNT as u32
-        {
-            write!(f, "{}", p.mnemonic())
-        } else {
-            write!(f, "v{}", self.id)
-        }
+        write!(f, "i{self:p}")
     }
 }
 
@@ -525,45 +541,29 @@ impl<'a, 's> IRChainBuilder<'a, 's> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComparisonOp {
-    Eq,
-    Ne,
-    Lt,
-    Gt,
-    Le,
-    Ge,
+#[derive(Default)]
+struct IRReg {
+    id: u32,
+    physical: Option<Register>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Condition<'a> {
-    Cmp { lhs: IRRegCell<'a>, rhs: IRRegCell<'a>, op: ComparisonOp },
-    EndOfLine,
-    Charset { cs: &'a Charset, min: u32, max: u32 },
-    Prefix(&'a str),
-    PrefixInsensitive(&'a str),
-}
+type IRRegCell<'a> = &'a RefCell<IRReg>;
 
-impl<'a> IR<'a> {
-    fn wants_next(&self) -> bool {
-        if self.next.is_some() {
-            return false;
-        }
-
-        match self.instr {
-            IRI::Mov { dst, .. } | IRI::MovImm { dst, .. }
-                if dst.borrow().id == Register::ProgramCounter as u32 =>
-            {
-                false
-            }
-            IRI::Return => false,
-            _ => true,
-        }
+impl IRReg {
+    fn new(id: u32) -> Self {
+        IRReg { id, physical: None }
     }
+}
 
-    fn set_next(&mut self, n: IRCell<'a>) {
-        debug_assert!(self.wants_next());
-        self.next = Some(n);
+impl fmt::Debug for IRReg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(p) = self.physical
+            && self.id < Register::COUNT as u32
+        {
+            write!(f, "{}", p.mnemonic())
+        } else {
+            write!(f, "v{}", self.id)
+        }
     }
 }
 

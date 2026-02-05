@@ -25,7 +25,7 @@
 use std::fmt::{self, Debug, Write as _};
 use std::mem;
 
-use stdext::arena::{Arena, ArenaString, scratch_arena};
+use stdext::arena::{Arena, ArenaString};
 
 /// A compiled language definition with its bytecode entrypoint.
 pub struct Language {
