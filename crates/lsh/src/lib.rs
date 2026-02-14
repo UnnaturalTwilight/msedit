@@ -48,9 +48,7 @@
 //!   The current definition files don't hit this, but complex patterns could.
 //! - No include statements, and all functions across all files share a single namespace.
 
-#![feature(allocator_api)]
 #![allow(irrefutable_let_patterns, clippy::upper_case_acronyms)]
-#![allow(unused)]
 
 pub mod compiler;
 pub mod runtime;
