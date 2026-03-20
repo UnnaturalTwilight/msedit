@@ -3,6 +3,7 @@
 
 use lsh::runtime::*;
 use stdext::arena::{Arena, scratch_arena};
+use stdext::collections::BVec;
 
 use crate::document::ReadableDocument;
 use crate::helpers::*;
@@ -57,10 +58,7 @@ impl<'doc> Highlighter<'doc> {
         self.runtime.restore(&snapshot.state);
     }
 
-    pub fn parse_next_line<'a>(
-        &mut self,
-        arena: &'a Arena,
-    ) -> Vec<Highlight<HighlightKind>, &'a Arena> {
+    pub fn parse_next_line<'a>(&mut self, arena: &'a Arena) -> BVec<'a, Highlight<HighlightKind>> {
         let scratch = scratch_arena(Some(arena));
         let (line_beg, line) = self.read_next_line(&scratch);
 
@@ -69,7 +67,7 @@ impl<'doc> Highlighter<'doc> {
         // If the line is too long, we don't highlight it.
         // This is to prevent performance issues with very long lines.
         if line.is_empty() || line.len() >= MAX_LINE_LEN {
-            return Vec::new_in(arena);
+            return BVec::empty();
         }
 
         let line = unicode::strip_newline(line);
@@ -113,12 +111,12 @@ impl<'doc> Highlighter<'doc> {
                 return (line_beg, &chunk[..off]);
             }
 
-            line_buf = Vec::new_in(arena);
+            line_buf = BVec::empty();
 
             // Ensure we don't overflow the heap size with a 1GB long line.
             let end = off.min(MAX_LINE_LEN - line_buf.len());
             let end = end.min(chunk.len());
-            line_buf.extend_from_slice(&chunk[..end]);
+            line_buf.extend_from_slice(arena, &chunk[..end]);
 
             chunk = next_chunk;
         }
@@ -131,7 +129,7 @@ impl<'doc> Highlighter<'doc> {
             // Ensure we don't overflow the heap size with a 1GB long line.
             let end = off.min(MAX_LINE_LEN - line_buf.len());
             let end = end.min(chunk.len());
-            line_buf.extend_from_slice(&chunk[..end]);
+            line_buf.extend_from_slice(arena, &chunk[..end]);
 
             // Start of the next line found.
             if line == 1 {
