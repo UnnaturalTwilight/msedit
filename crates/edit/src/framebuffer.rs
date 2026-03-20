@@ -511,9 +511,9 @@ impl Framebuffer {
                     let diff = last_attr ^ attr;
                     if diff.is(Attributes::Bold) {
                         if attr.is(Attributes::Bold) {
-                            result.push_str("\x1b[1m");
+                            result.push_str(arena, "\x1b[1m");
                         } else {
-                            result.push_str("\x1b[22m");
+                            result.push_str(arena, "\x1b[22m");
                         }
                     }
                     if diff.is(Attributes::Italic) {
@@ -532,9 +532,9 @@ impl Framebuffer {
                     }
                     if diff.is(Attributes::Strikethrough) {
                         if attr.is(Attributes::Strikethrough) {
-                            result.push_str("\x1b[9m");
+                            result.push_str(arena, "\x1b[9m");
                         } else {
-                            result.push_str("\x1b[29m");
+                            result.push_str(arena, "\x1b[29m");
                         }
                     }
                     last_attr = attr;

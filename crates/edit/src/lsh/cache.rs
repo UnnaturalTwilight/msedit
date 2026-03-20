@@ -3,6 +3,7 @@
 
 use lsh::runtime::Highlight;
 use stdext::arena::{Arena, scratch_arena};
+use stdext::collections::BVec;
 
 use crate::helpers::CoordType;
 use crate::lsh::{HighlightKind, Highlighter, HighlighterState};
@@ -33,7 +34,7 @@ impl HighlighterCache {
         arena: &'a Arena,
         highlighter: &mut Highlighter,
         line: CoordType,
-    ) -> Vec<Highlight<HighlightKind>, &'a Arena> {
+    ) -> BVec<'a, Highlight<HighlightKind>> {
         // Do we need to random seek?
         if line != highlighter.logical_pos_y() {
             // If so, restore the nearest, preceeding checkpoint...
@@ -65,7 +66,7 @@ impl HighlighterCache {
         &mut self,
         arena: &'a Arena,
         highlighter: &mut Highlighter,
-    ) -> Vec<Highlight<HighlightKind>, &'a Arena> {
+    ) -> BVec<'a, Highlight<HighlightKind>> {
         // If we need to store a checkpoint for the start of the next line, do so now.
         if Self::floor_line_to_offset(highlighter.logical_pos_y()) == self.checkpoints.len() {
             self.checkpoints.push(highlighter.snapshot());
