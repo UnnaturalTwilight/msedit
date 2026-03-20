@@ -26,6 +26,8 @@ use std::fmt::{self, Debug};
 use std::mem;
 
 use stdext::arena::Arena;
+use stdext::arena_write_fmt;
+use stdext::collections::{BString, BVec};
 
 /// A compiled language definition with its bytecode entrypoint.
 pub struct Language {
@@ -714,8 +716,6 @@ macro_rules! instruction_decode {
 }
 
 use instruction_decode;
-use stdext::arena_write_fmt;
-use stdext::collections::{BString, BVec};
 
 impl Instruction {
     // JumpIfMatchCharset, etc., are 1 byte opcode + 4 u32 parameters.

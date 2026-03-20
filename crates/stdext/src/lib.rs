@@ -11,6 +11,5 @@ mod helpers;
 pub mod simd;
 pub mod sys;
 pub mod unicode;
-pub mod varint;
 
 pub use helpers::*;
