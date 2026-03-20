@@ -74,7 +74,7 @@ impl<'doc> Highlighter<'doc> {
         let mut res = self.runtime.parse_next_line(arena, line);
 
         // Adjust the range to account for the line offset.
-        for h in &mut res {
+        for h in res.iter_mut() {
             h.start = line_beg + h.start.min(line.len());
         }
 

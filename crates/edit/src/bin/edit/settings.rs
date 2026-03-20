@@ -56,7 +56,7 @@ impl Settings {
         if let Some(f) = root.get_object("fileAssociations") {
             for &(mut key, ref value) in f.iter() {
                 if !key.contains('/') {
-                    key = arena_format!(&scratch, "**/{key}").leak();
+                    key = arena_format!(&*scratch, "**/{key}").leak();
                 }
 
                 let Some(id) = value.as_str() else {

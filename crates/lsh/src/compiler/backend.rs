@@ -350,6 +350,8 @@ impl<'a> Backend<'a> {
 
                 ir = next.borrow_mut();
 
+                // If the next instruction was already serialized (e.g. this is some form of loop),
+                // simply jump to the already serialized code. We're done here. Nothing new will come after this.
                 if ir.offset != usize::MAX {
                     self.push_instruction(MovImm {
                         dst: Register::ProgramCounter,
@@ -520,6 +522,7 @@ impl<'a> LivenessAnalysis<'a> {
 
         let ir = cell.borrow();
 
+        #[allow(clippy::collapsible_match)]
         match ir.instr {
             IRI::Mov { dst, src } => {
                 if dst.borrow().physical.is_none() {
