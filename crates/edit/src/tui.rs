@@ -2373,6 +2373,7 @@ impl<'a> Context<'a, '_> {
             let key = input.key();
             let modifiers = input.modifiers();
 
+            // eprintln!("Key: {:?} ({:?}) Mods: {:?}\r", char::from_u32(key.value()).unwrap_or_default(), key.value(), (input.value() & 0xFF000000) >> 24 );
             make_cursor_visible = true;
 
             match key {
