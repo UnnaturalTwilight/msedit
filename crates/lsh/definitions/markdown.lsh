@@ -2,10 +2,10 @@
 #[path = "**/*.md"]
 pub fn markdown() {
     // Any lines that start with a tab or 4+ spaces are code blocks.
-    if /(?:\t|    ).*/ {
-        yield other;
-        return;
-    }
+    //if /(?:\t|    ).*/ {
+    //    yield other;
+    //    return;
+    //}
 
     // Gobble any leading whitespace on the line.
     if /\s+/ {
@@ -154,7 +154,7 @@ pub fn markdown() {
                         if /\\./ {
                             // gobble escape char
                         } else if /[^\s_]+__/ {
-                            yield markup.bold;
+                            yield markup.link;
                             break;
                         } else if /__/ {
                             break;
