@@ -2215,7 +2215,8 @@ impl<'a> Context<'a, '_> {
 
         if single_line {
             node.attributes.fg = self.indexed(IndexedColor::Foreground);
-            node.attributes.bg = self.indexed(IndexedColor::Background);
+            // Don't let the input line be transparent
+            node.attributes.bg = self.indexed_alpha(IndexedColor::Background, 1, 3);
             if !content.has_focus {
                 node.attributes.fg = self.contrasted(node.attributes.bg);
                 node.attributes.bg = self.indexed_alpha(IndexedColor::Background, 1, 2);
