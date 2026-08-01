@@ -244,6 +244,7 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
     let mut dir = None;
     let mut parse_args = true;
     let mut goto_next = false;
+    let mut goto_target = false;
 
     // The best CLI argument parser in the world.
     for arg in env::args_os().skip(1) {
@@ -254,6 +255,7 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
                 continue;
             }
             if arg == "-" {
+                // TODO !! goto on stdin??
                 paths.clear();
                 break;
             }
@@ -271,12 +273,15 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
             }
         }
 
-        let (arg, goto) = if goto_next {
+        let (arg, goto, target) = if goto_next {
             goto_next = false;
             documents::parse_filename_goto(Path::new(&arg))
+        } else if goto_target {
+            (Path::new(&arg), paths.pop().map(|p: (_, Option<Point>)| p.1).unwrap_or_default(), false)
         } else {
-            (Path::new(&arg), None)
+            (Path::new(&arg), None, false)
         };
+        goto_target = target;
 
         let p = cwd.join(arg);
         let p = path::normalize(&p);
