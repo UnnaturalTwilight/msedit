@@ -296,7 +296,7 @@ impl DocumentManager {
 
 /// Parse a filename in the form of "filename:line:char".
 /// Returns the filename and the [`Document::cursor_move_to_goto`] coordinates.
-pub fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>) {
+pub fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>, bool) {
     fn parse(s: &[u8]) -> Option<CoordType> {
         let (negative, digits) = match s {
             [b'-', rest @ ..] => (true, rest),
@@ -322,16 +322,38 @@ pub fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>) {
     }
 
     let bytes = path.as_os_str().as_encoded_bytes();
+
+    // Parse "+line,col <file>" style goto
+    if bytes.starts_with(b"+") {
+        let comma = match (0..bytes.len()).rev().find(|&i| bytes[i] == b',') {
+            Some(comma) => comma,
+            None => 0,
+        };
+        let last = match parse(&bytes[comma + 1..]) {
+            Some(last) => last,
+            None => return (Path::new(path), None, false),
+        };
+        let mut goto = Point { x: 1, y: last };
+        if comma != 0
+            && let Some(first) = parse(&bytes[1..comma])
+        {
+            // TODO !! Properly suport counting backwards for columns, for now it just puts the cursor at the start
+            goto = Point { x: last, y: first };
+        }
+        return (Path::new(""), Some(goto), true);
+    }
+
+    // Parse "<file>:line:char" style goto
     let colend = match find_colon_rev(bytes, bytes.len()) {
         // Reject filenames that would result in an empty filename after stripping off the :line:char suffix.
         // For instance, a filename like ":123:456" will not be processed by this function.
         Some(colend) if colend > 0 => colend,
-        _ => return (path, None),
+        _ => return (path, None, false),
     };
 
     let last = match parse(&bytes[colend + 1..]) {
         Some(last) => last,
-        None => return (path, None),
+        None => return (path, None, false),
     };
     let mut len = colend;
     let mut goto = Point { x: 1, y: last };
@@ -352,7 +374,7 @@ pub fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>) {
     let path = &bytes[..len];
     let path = unsafe { OsStr::from_encoded_bytes_unchecked(path) };
     let path = Path::new(path);
-    (path, Some(goto))
+    (path, Some(goto), false)
 }
 
 #[cfg(test)]
@@ -362,7 +384,7 @@ mod tests {
     #[test]
     fn test_parse_last_numbers() {
         fn parse(s: &str) -> (&str, Option<Point>) {
-            let (p, g) = parse_filename_goto(Path::new(s));
+            let (p, g, _) = parse_filename_goto(Path::new(s));
             (p.to_str().unwrap(), g)
         }
 
