@@ -285,7 +285,7 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
 
         let p = cwd.join(arg);
         let p = path::normalize(&p);
-        if p.is_dir() {
+        if p.is_dir() && !target {
             state.wants_file_picker = StateFilePicker::Open;
             dir = Some(p);
         } else {
