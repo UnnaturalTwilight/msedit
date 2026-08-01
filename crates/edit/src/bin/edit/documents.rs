@@ -334,9 +334,11 @@ pub fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>, bool) {
             None => return (Path::new(path), None, false),
         };
         let mut goto = Point { x: 1, y: last };
-        if comma != 0
-            && let Some(first) = parse(&bytes[1..comma])
-        {
+        if comma != 0 {
+            let first = match parse(&bytes[1..comma]) {
+                Some(first) => first,
+                None => return (Path::new(path), None, false),
+            };
             // TODO !! Properly suport counting backwards for columns, for now it just puts the cursor at the start
             goto = Point { x: last, y: first };
         }
@@ -410,5 +412,23 @@ mod tests {
         assert_eq!(parse("file.txt:-10:5"), ("file.txt", Some(Point { x: 5, y: -10 })));
         assert_eq!(parse("file.txt:10:-5"), ("file.txt:10", Some(Point { x: 1, y: -5 })));
         assert_eq!(parse("file.txt:-"), ("file.txt:-", None));
+    }
+
+    #[test]
+    fn test_parse_plus_numbers() {
+        fn parse(s: &str) -> (&str, Option<Point>, bool) {
+            let (p, g, t) = parse_filename_goto(Path::new(s));
+            (p.to_str().unwrap(), g, t)
+        }
+
+        assert_eq!(parse("123"), ("123", None, false));
+        assert_eq!(parse("abc"), ("abc", None, false));
+        assert_eq!(parse("+abc"), ("+abc", None, false));
+        assert_eq!(parse("+abc,123"), ("+abc,123", None, false));
+        assert_eq!(parse("+123,abc"), ("+123,abc", None, false));
+        assert_eq!(parse("+123"), ("", Some(Point { x: 1, y: 123 }), true));
+        assert_eq!(parse("+1,2"), ("", Some(Point { x: 2, y: 1 }), true));
+        assert_eq!(parse("+-3"), ("", Some(Point { x: 1, y: -3 }), true));
+        assert_eq!(parse("+-4,5"), ("", Some(Point { x: 5, y: -4 }), true));
     }
 }
