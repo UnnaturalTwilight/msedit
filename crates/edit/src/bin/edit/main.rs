@@ -250,6 +250,7 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
 
     // The best CLI argument parser in the world.
     for arg in env::args_os().skip(1) {
+        let arg = arg.into_string().unwrap_or_default();
         if parse_args {
             if arg == "--" {
                 parse_args = false;
@@ -275,7 +276,7 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
             }
         }
 
-        let (arg, goto, target) = if goto_next {
+        let (arg, goto, target) = if goto_next || arg.starts_with('+') && !goto_target {
             goto_next = false;
             documents::parse_filename_goto(Path::new(&arg))
         } else if goto_target {
@@ -293,6 +294,11 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
         } else {
             paths.push(&*scratch, (p, goto));
         }
+    }
+
+    // Remove trailing goto if there are no paths left to process.
+    if goto_target {
+        paths.pop();
     }
 
     for (p, goto) in &paths {
