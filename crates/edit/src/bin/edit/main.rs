@@ -244,10 +244,11 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
     let mut dir = None;
     let mut parse_args = true;
     let mut goto_next = false;
-    let mut goto_target = false;
+    let mut goto_target = None;
 
     // The best CLI argument parser in the world.
     for arg in env::args_os().skip(1) {
+        // TODO !! Throw helpful error
         let arg = arg.into_string().unwrap_or_default();
         if parse_args {
             if arg == "--" {
@@ -272,31 +273,31 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
                 print_version();
                 return Ok(true);
             }
+            if arg.starts_with('+') {
+                if let Some(target) = documents::parse_prefix_goto(&arg) {
+                    goto_target = Some(target);
+                    goto_next = false;
+                    continue;
+                }
+            }
         }
 
-        let (arg, goto, target) = if goto_next || arg.starts_with('+') && !goto_target {
+        let (arg, goto) = if goto_next {
             goto_next = false;
             documents::parse_filename_goto(Path::new(&arg))
-        } else if goto_target {
-            (Path::new(&arg), paths.pop().map(|p: (_, Option<Point>)| p.1).unwrap_or_default(), false)
         } else {
-            (Path::new(&arg), None, false)
+            (Path::new(&arg), goto_target)
         };
-        goto_target = target;
+        goto_target = None;
 
         let p = cwd.join(arg);
         let p = path::normalize(&p);
-        if p.is_dir() && !target {
+        if p.is_dir() {
             state.wants_file_picker = StateFilePicker::Open;
             dir = Some(p);
         } else {
             paths.push(&*scratch, (p, goto));
         }
-    }
-
-    // Remove trailing goto if there are no paths left to process.
-    if goto_target {
-        paths.pop();
     }
 
     for (p, goto) in &paths {

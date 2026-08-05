@@ -294,68 +294,45 @@ impl DocumentManager {
     }
 }
 
-/// Parse a filename in the form of "filename:line:char".
-/// Returns the filename and the [`Document::cursor_move_to_goto`] coordinates.
-pub fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>, bool) {
-    fn parse(s: &[u8]) -> Option<CoordType> {
-        let (negative, digits) = match s {
-            [b'-', rest @ ..] => (true, rest),
-            _ => (false, s),
-        };
-        if digits.is_empty() {
-            return None;
-        }
-
-        let mut num: CoordType = 0;
-        for &b in digits {
-            if !b.is_ascii_digit() {
-                return None;
-            }
-            let digit = (b - b'0') as CoordType;
-            num = num.checked_mul(10)?.checked_add(digit)?;
-        }
-        Some(if negative { -num } else { num })
+fn parse(s: &[u8]) -> Option<CoordType> {
+    let (negative, digits) = match s {
+        [b'-', rest @ ..] => (true, rest),
+        _ => (false, s),
+    };
+    if digits.is_empty() {
+        return None;
     }
 
+    let mut num: CoordType = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        let digit = (b - b'0') as CoordType;
+        num = num.checked_mul(10)?.checked_add(digit)?;
+    }
+    Some(if negative { -num } else { num })
+}
+
+/// Parse a filename in the form of "filename:line:char".
+/// Returns the filename and the [`Document::cursor_move_to_goto`] coordinates.
+pub fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>) {
     fn find_colon_rev(bytes: &[u8], offset: usize) -> Option<usize> {
         (0..offset.min(bytes.len())).rev().find(|&i| bytes[i] == b':')
     }
 
     let bytes = path.as_os_str().as_encoded_bytes();
 
-    // Parse "+line,col <file>" style goto
-    if bytes.starts_with(b"+") {
-        let comma = match (0..bytes.len()).rev().find(|&i| bytes[i] == b',') {
-            Some(comma) => comma,
-            None => 0,
-        };
-        let last = match parse(&bytes[comma + 1..]) {
-            Some(last) => last,
-            None => return (Path::new(path), None, false),
-        };
-        let mut goto = Point { x: 1, y: last };
-        if comma != 0 {
-            let first = match parse(&bytes[1..comma]) {
-                Some(first) => first,
-                None => return (Path::new(path), None, false),
-            };
-            // TODO !! Properly suport counting backwards for columns, for now it just puts the cursor at the start
-            goto = Point { x: last, y: first };
-        }
-        return (Path::new(""), Some(goto), true);
-    }
-
-    // Parse "<file>:line:char" style goto
     let colend = match find_colon_rev(bytes, bytes.len()) {
         // Reject filenames that would result in an empty filename after stripping off the :line:char suffix.
         // For instance, a filename like ":123:456" will not be processed by this function.
         Some(colend) if colend > 0 => colend,
-        _ => return (path, None, false),
+        _ => return (path, None),
     };
 
     let last = match parse(&bytes[colend + 1..]) {
         Some(last) => last,
-        None => return (path, None, false),
+        None => return (path, None),
     };
     let mut len = colend;
     let mut goto = Point { x: 1, y: last };
@@ -376,7 +353,35 @@ pub fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>, bool) {
     let path = &bytes[..len];
     let path = unsafe { OsStr::from_encoded_bytes_unchecked(path) };
     let path = Path::new(path);
-    (path, Some(goto), false)
+    (path, Some(goto))
+}
+
+/// Parse a "+line,col" style goto.
+/// Returns the [`Document::cursor_move_to_goto`] coordinates.
+pub fn parse_prefix_goto(arg: &str) -> Option<Point> {
+    let bytes = arg.as_bytes();
+    if bytes[0] != b'+' {
+        return None;
+    }
+
+    let comma = match (0..bytes.len()).rev().find(|&i| bytes[i] == b',') {
+        Some(comma) => comma,
+        None => 0,
+    };
+    let last = match parse(&bytes[comma + 1..]) {
+        Some(last) => last,
+        None => return None,
+    };
+    let mut goto = Point { x: 1, y: last };
+    if comma != 0 {
+        let first = match parse(&bytes[1..comma]) {
+            Some(first) => first,
+            None => return None,
+        };
+        // TODO !! Properly suport counting backwards for columns, for now it just puts the cursor at the start
+        goto = Point { x: last, y: first };
+    }
+    return Some(goto);
 }
 
 #[cfg(test)]
@@ -386,7 +391,7 @@ mod tests {
     #[test]
     fn test_parse_last_numbers() {
         fn parse(s: &str) -> (&str, Option<Point>) {
-            let (p, g, _) = parse_filename_goto(Path::new(s));
+            let (p, g) = parse_filename_goto(Path::new(s));
             (p.to_str().unwrap(), g)
         }
 
@@ -416,19 +421,14 @@ mod tests {
 
     #[test]
     fn test_parse_plus_numbers() {
-        fn parse(s: &str) -> (&str, Option<Point>, bool) {
-            let (p, g, t) = parse_filename_goto(Path::new(s));
-            (p.to_str().unwrap(), g, t)
-        }
-
-        assert_eq!(parse("123"), ("123", None, false));
-        assert_eq!(parse("abc"), ("abc", None, false));
-        assert_eq!(parse("+abc"), ("+abc", None, false));
-        assert_eq!(parse("+abc,123"), ("+abc,123", None, false));
-        assert_eq!(parse("+123,abc"), ("+123,abc", None, false));
-        assert_eq!(parse("+123"), ("", Some(Point { x: 1, y: 123 }), true));
-        assert_eq!(parse("+1,2"), ("", Some(Point { x: 2, y: 1 }), true));
-        assert_eq!(parse("+-3"), ("", Some(Point { x: 1, y: -3 }), true));
-        assert_eq!(parse("+-4,5"), ("", Some(Point { x: 5, y: -4 }), true));
+        assert_eq!(parse_prefix_goto("123"), None);
+        assert_eq!(parse_prefix_goto("abc"), None);
+        assert_eq!(parse_prefix_goto("+abc"), None);
+        assert_eq!(parse_prefix_goto("+abc,123"), None);
+        assert_eq!(parse_prefix_goto("+123,abc"), None);
+        assert_eq!(parse_prefix_goto("+123"), Some(Point { x: 1, y: 123 }));
+        assert_eq!(parse_prefix_goto("+1,2"), Some(Point { x: 2, y: 1 }));
+        assert_eq!(parse_prefix_goto("+-3"), Some(Point { x: 1, y: -3 }));
+        assert_eq!(parse_prefix_goto("+-4,5"), Some(Point { x: 5, y: -4 }));
     }
 }
