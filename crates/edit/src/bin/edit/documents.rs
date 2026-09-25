@@ -325,10 +325,7 @@ pub fn parse_filename_goto(path: &Path) -> (&Path, Option<Point>, bool) {
 
     // Parse "+line,col <file>" style goto
     if bytes.starts_with(b"+") {
-        let comma = match (0..bytes.len()).rev().find(|&i| bytes[i] == b',') {
-            Some(comma) => comma,
-            None => 0,
-        };
+        let comma = (0..bytes.len()).rev().find(|&i| bytes[i] == b',').unwrap_or_default();
         let last = match parse(&bytes[comma + 1..]) {
             Some(last) => last,
             None => return (Path::new(path), None, false),
