@@ -280,7 +280,11 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
             goto_next = false;
             documents::parse_filename_goto(Path::new(&arg))
         } else if goto_target {
-            (Path::new(&arg), paths.pop().map(|p: (_, Option<Point>)| p.1).unwrap_or_default(), false)
+            (
+                Path::new(&arg),
+                paths.pop().map(|p: (_, Option<Point>)| p.1).unwrap_or_default(),
+                false,
+            )
         } else {
             (Path::new(&arg), None, false)
         };
